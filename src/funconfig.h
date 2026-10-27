@@ -42,10 +42,26 @@
 /* ------------------------------------------------------------------ *
  * Core / interrupts
  *
- * No xw extension on this part: the WCH fast interrupt entry cannot be used,
- * so handlers are plain functions (INTERRUPT_DECORATOR expands to nothing).
+ * FUNCONF_ENABLE_HPE = 1 lets the core stack the registers on interrupt entry
+ * (WCH calls it the hardware prologue).  ch32fun's handle_reset() then writes
+ * INTSYSCR = 0x0b, the same thing WCH's own startup_ch32l103.S does
+ * (INTSYSCR = 0x2), and handlers compile to a bare `mret` with no save/restore:
+ * faster entry and ~44 B smaller.
+ *
+ * This part supports it - WCH's L103 EVT enables HPE in its startup file and
+ * declares its own ISRs with interrupt("WCH-Interrupt-fast").  The attribute is
+ * not an ISA extension: it compiles with plain -march=rv32imac and only
+ * suppresses the compiler's prologue, so what it needs is HPE enabled at run
+ * time, not "xw".
+ *
+ * Cost: the "WCH-Interrupt-fast" attribute is a WCH compiler extension, so a
+ * build with HPE=1 needs the WCH toolchain.  Set it to 0 for a portable image
+ * (INTERRUPT_DECORATOR becomes the standard __attribute__((interrupt)), which
+ * any RISC-V GCC understands) at ~44 B and a few cycles per interrupt.
  * ------------------------------------------------------------------ */
-#define FUNCONF_ENABLE_HPE 0
+#ifndef FUNCONF_ENABLE_HPE
+#define FUNCONF_ENABLE_HPE 1
+#endif
 
 /* SysTick counts HCLK cycles; it is the time base for gs_usb timestamps. */
 #define FUNCONF_SYSTICK_USE_HCLK 1
