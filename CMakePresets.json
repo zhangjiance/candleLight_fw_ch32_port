@@ -1,0 +1,53 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 22,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "description": "Base preset for the CH32L103 candleLight port",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "BOARD": "ch32l103_candle"
+            }
+        },
+        {
+            "name": "base-debug",
+            "hidden": true,
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "ch32l103_candle-release",
+            "displayName": "CH32L103 candle (Release, -O3)",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build/ch32l103_candle-release"
+        },
+        {
+            "name": "ch32l103_candle-debug",
+            "displayName": "CH32L103 candle (Debug)",
+            "inherits": "base-debug",
+            "binaryDir": "${sourceDir}/build/ch32l103_candle-debug"
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "ch32l103_candle-release",
+            "configurePreset": "ch32l103_candle-release",
+            "jobs": 8
+        },
+        {
+            "name": "ch32l103_candle-debug",
+            "configurePreset": "ch32l103_candle-debug",
+            "jobs": 8
+        }
+    ]
+}
