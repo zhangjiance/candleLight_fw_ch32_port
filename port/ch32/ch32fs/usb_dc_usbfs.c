@@ -21,6 +21,16 @@
 #include "usbd_core.h"
 #include "usb_ch32_usbfs_reg.h"
 
+/* ch32fun's INTERRUPT_DECORATOR, mirrored locally: including ch32fun.h here
+ * would pull in its USB_PID_* register bits, which collide with CherryUSB's
+ * packet-id macros.  Kept in step with FUNCONF_ENABLE_HPE (see src/funconfig.h). */
+#include "funconfig.h"
+#if defined(FUNCONF_ENABLE_HPE) && FUNCONF_ENABLE_HPE
+#define USBFS_IRQ_ATTR __attribute__((interrupt("WCH-Interrupt-fast")))
+#else
+#define USBFS_IRQ_ATTR __attribute__((interrupt))
+#endif
+
 #ifdef CONFIG_USB_HS
 #error "usb fs do not support hs"
 #endif
@@ -419,7 +429,11 @@ void USBD_IRQHandler(uint8_t busid)
     }
 }
 
-void USBFS_IRQHandler(void);
+/* Upstream hardcodes __attribute__((interrupt("WCH-Interrupt-fast"))).  Using
+ * ch32fun's decorator instead keeps this file in step with FUNCONF_ENABLE_HPE:
+ * HPE on -> the core stacks the registers and this is a bare mret, HPE off ->
+ * the compiler saves them. */
+void USBFS_IRQHandler(void) USBFS_IRQ_ATTR;
 void USBFS_IRQHandler(void)
 {
     extern void USBD_IRQHandler(uint8_t busid);

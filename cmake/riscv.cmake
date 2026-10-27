@@ -1,10 +1,12 @@
 # ==============================================================================
 # Toolchain and flags for the CH32L103 candleLight port (ch32fun based)
 #
-# CH32L103 is plain rv32imac - no "xw" extension, so the WCH fast interrupt
-# entry is *not* available: handlers must be written as ordinary functions and
-# ch32fun's INTERRUPT_DECORATOR takes care of the ABI.  (Contrast with the
-# CH32V30x projects, which build with -march=rv32imacxw.)
+# CH32L103 builds as plain rv32imac.  The hardware prologue (HPE) is available
+# on this part - WCH's own startup_ch32l103.S sets INTSYSCR = 0x2 and the EVT
+# handlers use interrupt("WCH-Interrupt-fast") - but the *attribute* does not
+# depend on the xw ISA string: it just suppresses the compiler's prologue and
+# emits a bare mret, so it needs HPE enabled at run time, not -march=...xw.
+# FUNCONF_ENABLE_HPE (src/funconfig.h) picks which style the handlers use.
 #
 # Entry point is InterruptVector: ch32fun's vector table lives in .init at
 # address 0, there is no _start stub.

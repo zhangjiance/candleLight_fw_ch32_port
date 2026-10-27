@@ -23,10 +23,16 @@
  * ~940 B on this part, a fifth of the firmware. */
 static volatile uint32_t ms_ticks;
 
-/* One tick per millisecond.  A plain function: CH32L103 has no "xw" extension,
- * so there is no fast interrupt entry to declare.  ch32fun's vector table holds
- * a weak SysTick_Handler, which this strong definition replaces. */
-void SysTick_Handler(void);
+/* One tick per millisecond.  ch32fun's vector table holds a weak
+ * SysTick_Handler, which this strong definition replaces.
+ *
+ * INTERRUPT_DECORATOR is what makes the compiler emit a trap return: without it
+ * the function ends in `ret` and the core jumps back to whatever ra held.
+ * Which decorator it expands to depends on FUNCONF_ENABLE_HPE (see
+ * src/funconfig.h): with HPE the core stacks the registers in hardware and the
+ * handler is a bare `mret`; without it the compiler saves the caller-saved
+ * registers itself.  Both return with `mret`, both work on this part. */
+void SysTick_Handler(void) INTERRUPT_DECORATOR;
 void SysTick_Handler(void)
 {
     SysTick->SR = 0;                        /* clear the compare flag */
