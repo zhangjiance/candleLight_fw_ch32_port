@@ -33,11 +33,18 @@ set(CH32FUN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party_components/ch32fun"
     CACHE PATH "ch32fun checkout (the submodule, or a path of your own)")
 set(CHERRYUSB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party_components/CherryUSB"
     CACHE PATH "CherryUSB submodule root")
+set(CANDLE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party_components/candleLight_fw"
+    CACHE PATH "candleLight_fw submodule root (the gs_usb application)")
 
 if(NOT EXISTS "${CH32FUN_ROOT}/ch32fun/ch32fun.c")
     message(FATAL_ERROR
         "ch32fun not found at ${CH32FUN_ROOT}.  Run "
         "git submodule update --init --recursive, or point -DCH32FUN_ROOT=... at it.")
+endif()
+if(NOT EXISTS "${CANDLE_ROOT}/src/usbd_desc.c")
+    message(FATAL_ERROR
+        "candleLight_fw not found at ${CANDLE_ROOT}.  Run "
+        "git submodule update --init --recursive.")
 endif()
 if(NOT EXISTS "${CHERRYUSB_ROOT}/core/usbd_core.c")
     message(FATAL_ERROR
@@ -105,9 +112,9 @@ target_sources(${PROJECT_TARGET} PRIVATE
     # board primitives
     ${BOARD_DIR}/board.c
     # candleLight core, verbatim from the submodule
-    ${CMAKE_CURRENT_SOURCE_DIR}/candleLight_fw/src/led.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/candleLight_fw/src/util.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/candleLight_fw/src/usbd_desc.c
+    ${CANDLE_ROOT}/src/led.c
+    ${CANDLE_ROOT}/src/util.c
+    ${CANDLE_ROOT}/src/usbd_desc.c
     # candleLight application, copied with an include seam
     ${CMAKE_CURRENT_SOURCE_DIR}/src/candle/main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/candle/usbd_gs_can.c
@@ -128,9 +135,9 @@ target_sources(${PROJECT_TARGET} PRIVATE
 target_include_directories(${PROJECT_TARGET} PRIVATE
     ${CH32FUN_ROOT}/ch32fun
     ${CMAKE_CURRENT_SOURCE_DIR}/port
-    ${CMAKE_CURRENT_SOURCE_DIR}/candleLight_fw/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/candleLight_fw/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/candleLight_fw/libs/STM32_USB_Device_Library/config
+    ${CANDLE_ROOT}/include
+    ${CANDLE_ROOT}/src
+    ${CANDLE_ROOT}/libs/STM32_USB_Device_Library/config
     ${cherryusb_incs}
     # register map for the vendored USBFS driver (upstream copy)
     ${CHERRYUSB_ROOT}/port/ch32/ch32fs
