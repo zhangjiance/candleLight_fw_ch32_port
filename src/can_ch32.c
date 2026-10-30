@@ -120,14 +120,9 @@ bool can_ch32_take_error(can_ch32_error_t *e)
 /* DLC <-> byte count, CAN FD wide. */
 static const uint8_t dlc_len[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64 };
 
-static uint8_t len_to_dlc(uint8_t len)
+uint8_t can_ch32_dlc_len(uint8_t dlc)
 {
-    for (uint8_t d = 0; d < 16U; d++) {
-        if (dlc_len[d] >= len) {
-            return d;
-        }
-    }
-    return 15U;
+    return dlc_len[dlc & 0x0FU];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -534,7 +529,7 @@ void can_ch32_stop(void)
 /* -------------------------------------------------------------------------- */
 bool can_ch32_send(const can_ch32_frame_t *f)
 {
-    if (f->len > CAN_CH32_MAX_LEN || (f->fd && !fd_enabled)) {
+    if (f->len > CAN_CH32_MAX_LEN || f->dlc > 15U || (f->fd && !fd_enabled)) {
         return false;
     }
 
@@ -583,7 +578,7 @@ bool can_ch32_send(const can_ch32_frame_t *f)
     }
 
     CAN1->sTxMailBox[mb].TXMIR   = mir;
-    CAN1->sTxMailBox[mb].TXMDTR  = (uint32_t)len_to_dlc(f->len) & 0x0FU;   /* DLC */
+    CAN1->sTxMailBox[mb].TXMDTR  = (uint32_t)f->dlc;                  /* DLC code */
 
     if (f->fd) {
         /* FD frame: CANFD_CR.TX_FD selects the FD format and the payload is
@@ -650,6 +645,7 @@ static bool can_read_fifo(uint32_t fifo, can_ch32_frame_t *f)
     f->fd       = ((mir & 0x1U) != 0U);          /* RXMIR bit0 = FDF */
     f->brs      = ((mdtr >> 4) & 1U) != 0U;
     f->esi      = ((mdtr >> 5) & 1U) != 0U;
+    f->dlc      = (uint8_t)dlc;
     f->len      = (uint8_t)dlc_len[dlc];
 
     if (dlc <= 8U) {

@@ -148,7 +148,7 @@ bool can_receive(can_data_t *channel, struct gs_host_frame *rx_frame)
 
     rx_frame->echo_id = 0xFFFFFFFFU;
     rx_frame->can_id  = f.id | (f.extended ? 0x80000000U : 0U) | (f.rtr ? 0x40000000U : 0U);
-    rx_frame->can_dlc = f.len;
+    rx_frame->can_dlc = f.dlc;
     rx_frame->channel = 0U;
     rx_frame->flags   = (uint8_t)((f.fd ? GS_CAN_FLAG_FD : 0U) |
                                   (f.brs ? GS_CAN_FLAG_BRS : 0U) |
@@ -179,7 +179,8 @@ bool can_send(can_data_t *channel, struct gs_host_frame *frame)
     f.id       = frame->can_id & (f.extended ? 0x1FFFFFFFU : 0x7FFU);
     f.fd       = (frame->flags & GS_CAN_FLAG_FD) != 0U;
     f.brs      = (frame->flags & GS_CAN_FLAG_BRS) != 0U;
-    f.len      = (uint8_t)(frame->can_dlc > CAN_CH32_MAX_LEN ? CAN_CH32_MAX_LEN : frame->can_dlc);
+    f.dlc      = (uint8_t)(frame->can_dlc & 0x0FU);
+    f.len      = can_ch32_dlc_len(f.dlc);
     memcpy(f.data, frame->canfd->data, f.len);
 
     if (!can_ch32_send(&f)) {

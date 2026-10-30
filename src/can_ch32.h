@@ -29,12 +29,14 @@
  * only) - the vendor struct has no RFIFO1/DMA_R[1]. */
 #define CAN_CH32_NUM_RX_FIFO 1U
 
-/* One frame in either direction; len is the real byte count (0..64), fd tells
- * whether it is an FD frame, brs whether the data phase switched rate. */
+/* One frame in either direction; len is the real byte count (0..64), dlc is
+ * the CAN DLC code (0..15, CAN FD wide), fd tells whether it is an FD frame,
+ * brs whether the data phase switched rate. */
 typedef struct {
     uint32_t id;
     uint8_t  data[CAN_CH32_MAX_LEN];
     uint8_t  len;
+    uint8_t  dlc;
     bool     extended;
     bool     rtr;
     bool     fd;
@@ -86,6 +88,9 @@ bool can_ch32_init(uint32_t pclk1,
 bool can_ch32_fd_enabled(void);
 
 void can_ch32_stop(void);
+
+/* DLC code -> actual payload bytes (CAN FD wide). */
+uint8_t can_ch32_dlc_len(uint8_t dlc);
 
 /* Queue one frame.  Returns false when no mailbox is free (or the frame cannot
  * be represented, e.g. FD requested but the controller is in classic mode). */
