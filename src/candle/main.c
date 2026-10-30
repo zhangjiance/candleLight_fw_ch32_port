@@ -120,7 +120,16 @@ int main(void)
 		for (unsigned int i = 0; i < ARRAY_SIZE(hGS_CAN.channels); i++) {
 			can_data_t *channel = &hGS_CAN.channels[i];
 
-			CAN_ReceiveFrame(&hGS_CAN, channel);
+			/* Drain what the 3-deep FIFO holds, not just one frame per loop
+			 * iteration, so a burst cannot overrun it while the USB stack is
+			 * busy.  Bounded: the frame pool can be exhausted, and the loop
+			 * must not stall enumeration. */
+			for (uint8_t drained = 0U;
+			     (drained < 8U) && can_is_rx_pending(channel);
+			     drained++) {
+				CAN_ReceiveFrame(&hGS_CAN, channel);
+			}
+
 			CAN_HandleError(&hGS_CAN, channel);
 			led_update(&channel->leds);
 		}
