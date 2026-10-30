@@ -2,6 +2,7 @@
 #include "status_led.h"
 
 #include "board.h"
+#include "board_config.h"  /* BOARD_HAS_LED / BOARD_LED_PIN, BOARD_HAS_LED2 */
 #include "hal_include.h" /* HAL_GetTick */
 
 #if defined(BOARD_HAS_WS2812) && BOARD_HAS_WS2812
@@ -463,6 +464,117 @@ void status_led_tick(void)
 /* ---------------------------------------------------------------------------
  * Backend 4: no LEDs at all
  * ------------------------------------------------------------------------- */
+#elif defined(BOARD_HAS_LED) && BOARD_HAS_LED
+/*
+ * One discrete status LED (BOARD_LED_PIN).  Language:
+ *   channel stopped   -> off
+ *   channel enabled   -> steady on
+ *   frame on the bus  -> short dark pulse (30 ms), so even back-to-back
+ *                        traffic stays visible as flicker
+ * The second LED is not touched here: it shows the termination state, see
+ * board_termination_cb() in src/port_board.c.
+ */
+#ifndef STATUS_LED_PULSE_MS
+#define STATUS_LED_PULSE_MS 30U
+#endif
+
+static bool s_status_enabled;
+static bool s_status_error;
+static uint32_t s_status_pulse_until;
+
+/* Wrap-safe "has the deadline passed" (SEQ_ISPASSED lives in led.c). */
+static bool status_led_time_passed(uint32_t now, uint32_t target)
+{
+    return (int32_t)(now - target) >= 0;
+}
+
+static void status_led_apply(bool on)
+{
+    const uint8_t level = BOARD_LED_ACTIVE_LOW ? (uint8_t)!on : (uint8_t)on;
+
+    funDigitalWrite(BOARD_LED_PIN, level ? FUN_HIGH : FUN_LOW);
+}
+
+static void status_led_refresh(void)
+{
+    const uint32_t now = HAL_GetTick();
+
+    if (!s_status_enabled) {
+        status_led_apply(false);
+        return;
+    }
+
+    if (!status_led_time_passed(now, s_status_pulse_until)) {
+        status_led_apply(false);                /* inside the activity pulse */
+        return;
+    }
+
+    /* Error (bus-off / error-passive) blinks at ~2 Hz. */
+    if (s_status_error) {
+        status_led_apply((now & 0x100U) != 0U);
+        return;
+    }
+
+    status_led_apply(true);
+}
+
+void status_led_init(void)
+{
+    RCC->APB2PCENR |= BOARD_GPIO_RCC;
+    funDigitalWrite(BOARD_LED_PIN, BOARD_LED_ACTIVE_LOW ? FUN_HIGH : FUN_LOW);
+    funPinMode(BOARD_LED_PIN, GPIO_CFGLR_OUT_10Mhz_PP);
+
+    s_status_enabled = false;
+    s_status_error = false;
+    s_status_pulse_until = 0U;
+    status_led_apply(false);
+}
+
+void status_led_boot_anim(void)
+{
+}
+
+void status_led_channel(uint8_t channel, bool enabled)
+{
+    if (channel != 0U) {
+        return;
+    }
+
+    s_status_enabled = enabled;
+    if (!enabled) {
+        s_status_pulse_until = 0U;
+        s_status_error = false;
+    }
+    status_led_refresh();
+}
+
+void status_led_activity(uint8_t channel, bool rx)
+{
+    (void)rx;
+
+    if ((channel != 0U) || !s_status_enabled) {
+        return;
+    }
+
+    s_status_pulse_until = HAL_GetTick() + STATUS_LED_PULSE_MS;
+    status_led_refresh();
+}
+
+void status_led_error(uint8_t channel, bool active)
+{
+    if (channel != 0U) {
+        return;
+    }
+
+    s_status_error = active;
+    status_led_refresh();
+}
+
+void status_led_tick(void)
+{
+    status_led_refresh();
+}
+
 #else
 
 void status_led_init(void) {}

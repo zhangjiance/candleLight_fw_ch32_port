@@ -12,6 +12,7 @@
 
 #include "config.h"
 #include "can.h"
+#include "can_common.h"      /* can_channel_get_nr() */
 #include "can_ch32.h"
 #include "board.h"
 #include "board_ch32.h"
@@ -19,6 +20,7 @@
 #include "gs_usb.h"
 #include "hal_include.h"
 #include "led.h"
+#include "status_led.h"
 
 /* gs_usb bit timing (segments in time quanta) -> our driver's form. */
 static void bt_from_gs(const struct gs_device_bittiming *bt, can_ch32_timing_t *out)
@@ -122,6 +124,7 @@ bool can_receive(can_data_t *channel, struct gs_host_frame *rx_frame)
     }
 
     led_indicate_trx(&channel->leds, LED_RX);
+    status_led_activity(can_channel_get_nr(channel), true);
     return true;
 }
 
@@ -143,6 +146,7 @@ bool can_send(can_data_t *channel, struct gs_host_frame *frame)
     }
 
     led_indicate_trx(&channel->leds, LED_TX);
+    status_led_activity(can_channel_get_nr(channel), false);
     return true;
 }
 
@@ -195,6 +199,7 @@ void can_drv_poll(can_data_t *channel)
 
     channel->state = GS_CAN_STATE_ERROR_ACTIVE;
     led_set_mode(&channel->leds, LED_MODE_NORMAL);
+    status_led_channel(can_channel_get_nr(channel), true);
 }
 
 void can_drv_disable(can_data_t *channel)
@@ -206,6 +211,7 @@ void can_drv_disable(can_data_t *channel)
 
     channel->state = GS_CAN_STATE_STOPPED;
     led_set_mode(&channel->leds, LED_MODE_OFF);
+    status_led_channel(can_channel_get_nr(channel), false);
 }
 
 void can_drv_read_reg_status(can_data_t *channel)
@@ -351,6 +357,9 @@ const struct gs_device_tdc_const CAN_tdc_const = {
     .mode     = GS_CAN_TDC_MODE_OFF | GS_CAN_TDC_MODE_AUTO,
 };
 
+/* src/port_board.c: applies the 120 ohm switch and its indicator LED. */
+void board_termination_set_state(enum gs_can_termination_state state);
+
 enum gs_can_termination_state get_term(can_data_t *channel)
 {
     (void)channel;
@@ -362,5 +371,6 @@ void set_term(can_data_t *channel, enum gs_can_termination_state state)
 {
     (void)channel;
 
-    board_set_termination(state != (enum gs_can_termination_state)0);
+    /* This is the path gs_usb takes (GS_USB_BREQ_SET_TERMINATION). */
+    board_termination_set_state(state);
 }

@@ -14,12 +14,37 @@
 #include "config.h"
 #include "gs_usb.h"
 
+#ifndef BOARD_LED2_ACTIVE_LOW
+#define BOARD_LED2_ACTIVE_LOW BOARD_LED_ACTIVE_LOW
+#endif
+
+/*
+ * The one place that applies a termination request: drives the 120 ohm switch
+ * and mirrors the state on LED2 (lit = termination engaged).
+ *
+ * Both call paths end up here: gs_usb's GS_USB_BREQ_SET_TERMINATION goes
+ * through set_term() in src/can_ch32_adapter.c, while candleLight's board
+ * table hook (config.termination_set) goes through board_termination_cb().
+ */
+void board_termination_set_state(enum gs_can_termination_state state)
+{
+    /* gs_usb: 0 = off, anything else = on. */
+    const bool on = state != (enum gs_can_termination_state)0;
+
+    board_set_termination(on);              /* the switch itself */
+
+#if BOARD_HAS_LED2
+    const uint8_t level = BOARD_LED2_ACTIVE_LOW ? (uint8_t)!on : (uint8_t)on;
+
+    funDigitalWrite(BOARD_LED2_PIN, level ? FUN_HIGH : FUN_LOW);
+#endif
+}
+
 static void board_termination_cb(can_data_t *channel, enum gs_can_termination_state state)
 {
     (void)channel;
 
-    /* gs_usb: 0 = off, anything else = on. */
-    board_set_termination(state != (enum gs_can_termination_state)0);
+    board_termination_set_state(state);
 }
 
 const struct board_config config = {
@@ -28,17 +53,22 @@ const struct board_config config = {
         {
             .interface = CAN1,
             .leds = {
-                /* The pin facts live in boards/<board>/board_config.h, the same
-                 * file the other CH32 projects use. */
+                /* The status LED is driven by src/status_led.c (off while the
+                 * channel is stopped, steady on while it is enabled, dark
+                 * pulse per frame), so candleLight's per-channel LED layer is
+                 * left unbound here: a NULL port makes led_set() a no-op and
+                 * keeps the two drivers from fighting over one pin.
+                 * The second LED shows the termination state, see
+                 * board_termination_cb() above. */
                 [LED_RX] = {
-                    .port = GpioOf(BOARD_LED_PIN),
-                    .pin = (uint16_t)(BOARD_LED_PIN & 0xFU),
-                    .active_high = (BOARD_LED_ACTIVE_LOW == 0),
+                    .port = NULL,
+                    .pin = 0U,
+                    .active_high = true,
                 },
                 [LED_TX] = {
-                    .port = GpioOf(BOARD_LED2_PIN),
-                    .pin = (uint16_t)(BOARD_LED2_PIN & 0xFU),
-                    .active_high = (BOARD_LED_ACTIVE_LOW == 0),
+                    .port = NULL,
+                    .pin = 0U,
+                    .active_high = true,
                 },
             },
         },
