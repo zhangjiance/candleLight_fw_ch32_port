@@ -15,6 +15,23 @@
 static uint8_t tx_buf[CAN_CH32_NUM_TX_MB][CAN_CH32_MAX_LEN] __attribute__((aligned(4)));
 static uint8_t rx_buf[CAN_CH32_NUM_RX_FIFO][CAN_CH32_MAX_LEN] __attribute__((aligned(4)));
 
+/*
+ * The controller's receive FIFO holds only one FD frame.  The CAN interrupt
+ * moves frames into this ring immediately; the main loop then drains it into
+ * the USB frame pool.  Without the ring a slow USB iteration overwrites the
+ * next frame in hardware.
+ *
+ * Single producer (IRQ) / single consumer (main loop), so head/tail are just
+ * volatile indices; the ring size must stay a power of two.
+ */
+#define CAN_CH32_RX_RING 32U
+static can_ch32_frame_t rx_ring[CAN_CH32_RX_RING];
+static volatile uint32_t rx_ring_head;
+static volatile uint32_t rx_ring_tail;
+
+_Static_assert((CAN_CH32_RX_RING & (CAN_CH32_RX_RING - 1U)) == 0U,
+               "CAN_CH32_RX_RING must be a power of two");
+
 static bool fd_enabled;
 
 /* Programmed transmitter delay offset (CANFD_TDCT.TDCO), needed to turn
@@ -314,8 +331,14 @@ bool can_ch32_init(uint32_t pclk1, can_ch32_timing_t *nominal,
     fd_enabled = fd;
     s_rx_overruns = 0U;
     s_rx_overruns_reported = 0U;
+    rx_ring_head = 0U;
+    rx_ring_tail = 0U;
 
     RCC->APB1PCENR |= RCC_APB1Periph_CAN1;
+
+    /* A restart must not race the RX interrupt while the cell is reset. */
+    CAN1->INTENR = 0U;
+    NVIC_DisableIRQ(USB_LP_CAN1_RX0_IRQn);
 
     /*
      * Start-up sequence of the vendor driver (EVT ch32l103_can.c CAN_Init()).
@@ -469,12 +492,20 @@ bool can_ch32_init(uint32_t pclk1, can_ch32_timing_t *nominal,
     /* Receive payload buffer for the (single) FIFO. */
     CAN1->CANFD_DMA_R[0] = (uint32_t)(uintptr_t)rx_buf[0];
 
-    CAN1->INTENR = 0U;
-
     CAN1->CTLR &= ~(uint32_t)CAN_CTLR_INRQ;
     if (!can_wait_inak(false)) {
         return false;
     }
+
+    /*
+     * Let the CAN interrupt empty the one-deep hardware FIFO into rx_ring.
+     * FOVIE0 is only for counting/reporting an overrun; the ring-full case is
+     * counted in can_ch32_irq_handler().
+     */
+    CAN1->INTENR = CAN_INTENR_FMPIE0 | CAN_INTENR_FOVIE0;
+    NVIC_ClearPendingIRQ(USB_LP_CAN1_RX0_IRQn);
+    NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, 0U);
+    NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
 
     return true;
 }
@@ -487,6 +518,11 @@ void can_ch32_stop(void)
      * core - which in turn stalls the USB interrupt and makes every bulk
      * OUT transfer on EP 0x02 time out. */
     RCC->APB1PCENR |= RCC_APB1Periph_CAN1;
+
+    CAN1->INTENR = 0U;
+    NVIC_DisableIRQ(USB_LP_CAN1_RX0_IRQn);
+    rx_ring_head = 0U;
+    rx_ring_tail = 0U;
 
     CAN1->CTLR |= CAN_CTLR_INRQ;
     CAN1->CTLR |= CAN_CTLR_SLEEP;
@@ -641,21 +677,50 @@ bool can_ch32_receive(can_ch32_frame_t *f)
 {
     RCC->APB1PCENR |= RCC_APB1Periph_CAN1;
 
-    for (uint32_t fifo = 0; fifo < CAN_CH32_NUM_RX_FIFO; fifo++) {
-        if (can_read_fifo(fifo, f)) {
-            return true;
-        }
+    const uint32_t tail = rx_ring_tail;
+    if (tail == rx_ring_head) {
+        return false;
     }
-    return false;
+
+    *f = rx_ring[tail];
+    __sync_synchronize();
+    rx_ring_tail = (tail + 1U) & (CAN_CH32_RX_RING - 1U);
+    return true;
 }
 
 void can_ch32_irq_handler(void)
 {
     can_ch32_frame_t f;
 
-    while (can_ch32_receive(&f)) {
-        /* The gs_usb layer polls; nothing to do here yet. */
+    RCC->APB1PCENR |= RCC_APB1Periph_CAN1;
+
+    /*
+     * Drain the one-deep hardware FIFO into the ring.  If the ring is full,
+     * keep reading and dropping: leaving a frame pending would retrigger the
+     * interrupt immediately, and the main loop gets the next chance to catch
+     * up once it has moved frames to USB.
+     */
+    while (can_read_fifo(0U, &f)) {
+        const uint32_t head = rx_ring_head;
+        const uint32_t next = (head + 1U) & (CAN_CH32_RX_RING - 1U);
+
+        if (next == rx_ring_tail) {
+            s_rx_overruns++;
+            continue;
+        }
+
+        rx_ring[head] = f;
+        __sync_synchronize();
+        rx_ring_head = next;
     }
+}
+
+/* USB LP and CAN1 RX0 share this vector on the CH32L103; the USB stack uses
+ * USBFS_IRQn, so RX0 is free for the CAN receive FIFO. */
+void USB_LP_CAN1_RX0_IRQHandler(void) INTERRUPT_DECORATOR;
+void USB_LP_CAN1_RX0_IRQHandler(void)
+{
+    can_ch32_irq_handler();
 }
 
 /* -------------------------------------------------------------------------- */
