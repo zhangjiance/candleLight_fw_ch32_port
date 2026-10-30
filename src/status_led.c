@@ -5,6 +5,24 @@
 #include "board_config.h"  /* BOARD_HAS_LED / BOARD_LED_PIN, BOARD_HAS_LED2 */
 #include "hal_include.h" /* HAL_GetTick */
 
+/*
+ * gs_usb IDENTIFY flag.  Declared outside the per-backend chain so that
+ * status_led_identify() exists for every backend; only the discrete-LED
+ * backend below acts on it (the WS2812 / channel-LED backends have their own
+ * sequences and simply ignore it).
+ */
+static bool s_status_identify;
+static uint32_t s_status_identify_next;
+static bool s_status_identify_level;
+
+void status_led_identify(bool on)
+{
+    s_status_identify = on;
+    s_status_identify_next = 0U;
+    s_status_identify_level = false;
+}
+
+
 #if defined(BOARD_HAS_WS2812) && BOARD_HAS_WS2812
 
 #include "ws2812.h"
@@ -495,9 +513,24 @@ static void status_led_apply(bool on)
     funDigitalWrite(BOARD_LED_PIN, level ? FUN_HIGH : FUN_LOW);
 }
 
+/* IDENTIFY blink period: a fast, unmistakable 4 Hz. */
+#define STATUS_LED_IDENTIFY_MS 125U
+
 static void status_led_refresh(void)
 {
     const uint32_t now = HAL_GetTick();
+
+    /* gs_usb IDENTIFY overrides everything else (the host keeps it on until
+     * it sends mode = 0). */
+    if (s_status_identify) {
+        if (status_led_time_passed(now, s_status_identify_next)) {
+            s_status_identify_next  = now + STATUS_LED_IDENTIFY_MS;
+            s_status_identify_level = !s_status_identify_level;
+        }
+
+        status_led_apply(s_status_identify_level);
+        return;
+    }
 
     if (!s_status_enabled) {
         status_led_apply(false);
@@ -544,6 +577,7 @@ void status_led_channel(uint8_t channel, bool enabled)
     if (!enabled) {
         s_status_pulse_until = 0U;
         s_status_error = false;
+        s_status_identify = false;
     }
     status_led_refresh();
 }

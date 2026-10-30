@@ -41,6 +41,8 @@
 #include "usbd_desc.h"
 #include "usbd_dfu.h"
 #include "usbd_gs_can.h"
+
+#include "status_led.h"   /* status_led_identify() */
 #include "util.h"
 
 static volatile bool is_usb_suspend_cb;
@@ -647,6 +649,11 @@ static uint8_t USBD_GS_CAN_EP0_RxReady(USBD_HandleTypeDef *pdev) {
 				led_set_mode(&channel->leds, can_is_enabled(channel) ?
 							 LED_MODE_NORMAL : LED_MODE_OFF);
 			}
+
+			/* The per-channel LED table is not bound on this board (the status LED
+			 * is driven by src/status_led.c), so the sequence above has no visible
+			 * effect - blink the status LED instead. */
+			status_led_identify(imode->mode != 0U);
 			break;
 		}
 		case GS_USB_BREQ_DATA_BITTIMING: {

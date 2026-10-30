@@ -20,6 +20,10 @@ void status_led_error(uint8_t channel, bool active);
 /* Non-blocking: ages the traffic/error windows and refreshes the board's LEDs. */
 void status_led_tick(void);
 
+/* gs_usb IDENTIFY (GS_USB_BREQ_IDENTIFY): make the adapter visibly
+ * identifiable, e.g. blink the status LED until the host clears it. */
+void status_led_identify(bool on);
+
 /* Start the boot comet (non-blocking, paced by status_led_tick()); call after status_led_init(). */
 void status_led_boot_anim(void);
 
