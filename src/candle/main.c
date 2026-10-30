@@ -43,7 +43,13 @@
 
 #include "status_led.h"
 
+#include "board_contract.h"        /* BOARD_USB_BASE */
+
 void initialise_monitor_handles(void);
+
+/* src/can_ch32_adapter.c: performs the CAN controller start outside the USB
+ * interrupt (can_drv_enable() only queues it). */
+void can_drv_poll(can_data_t *channel);
 
 static USBD_GS_CAN_HandleTypeDef hGS_CAN;
 static USBD_HandleTypeDef hUSB = {0};
@@ -55,6 +61,7 @@ int main(void)
 
 	HAL_Init();
 	device_sysclock_config();
+
 
 	board_setup(&hGS_CAN);
 	timer_init();
@@ -83,32 +90,27 @@ int main(void)
 				 led_config[LED_TX].port, led_config[LED_TX].pin, led_config[LED_TX].active_high);
 
 		can_init(channel, channel_config);
+
 		can_disable(&hGS_CAN, channel);
 	}
 
+	/*
+	 * USB comes up last, like upstream candleLight: the gs_usb class arms its OUT
+	 * endpoint as soon as the host configures the device, and that needs the frame
+	 * pool and the channel bookkeeping above to exist already - otherwise the class
+	 * finds an empty pool, never arms EP 0x02 and the host times out on every bulk
+	 * OUT transfer.
+	 */
 	USBD_Init(&hUSB, (USBD_DescriptorsTypeDef *)&FS_Desc, DEVICE_FS);
 	USBD_RegisterClass(&hUSB, &USBD_GS_CAN);
 	USBD_GS_CAN_Init(&hGS_CAN, &hUSB);
 	USBD_Start(&hUSB);
 
-	for (unsigned int i = 0; i < ARRAY_SIZE(hGS_CAN.channels); i++) {
-		const struct board_channel_config *channel_config = &config.channel[i];
-		const struct led_config *led_config = channel_config->leds;
-
-		/* Skip LED wake-up without LEDs. */
-		if (led_config[LED_RX].port != NULL) {
-			for (uint8_t j = 0; j < 10; j++) {
-				HAL_GPIO_TogglePin(led_config[LED_RX].port, led_config[LED_RX].pin);
-				HAL_Delay(50);
-				HAL_GPIO_TogglePin(led_config[LED_TX].port, led_config[LED_TX].pin);
-			}
-		}
-	}
-
 	while (1) {
 		for (unsigned int i = 0; i < ARRAY_SIZE(hGS_CAN.channels); i++) {
 			can_data_t *channel = &hGS_CAN.channels[i];
 
+			can_drv_poll(channel);      /* deferred CAN controller start */
 			CAN_SendFrame(&hGS_CAN, channel);
 		}
 
@@ -120,7 +122,6 @@ int main(void)
 
 			CAN_ReceiveFrame(&hGS_CAN, channel);
 			CAN_HandleError(&hGS_CAN, channel);
-
 			led_update(&channel->leds);
 		}
 

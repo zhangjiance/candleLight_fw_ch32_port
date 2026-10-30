@@ -19,6 +19,8 @@
 #define USB_NOCACHE_RAM_SECTION
 
 #define CONFIG_USB_DEVICE       1
+/* No CherryUSB class is used: the gs_usb device is implemented in
+ * src/candle/usbd_gs_can.c on top of the core only. */
 #define CONFIG_USBDEV_MAX_BUS   1
 
 /* gs_usb needs no WCID/MS OS descriptors: Windows binds the libusb driver
@@ -29,8 +31,11 @@
  * so the stack's request buffer stays small. */
 #define CONFIG_USBDEV_REQUEST_BUFFER_LEN 512
 
-/* EP0 + 2 bulk endpoints (IN/OUT). */
-#define CONFIG_USBDEV_EP_NUM    3
+/* EP0 + 2 bulk endpoints (IN/OUT) are used, but the controller driver
+ * programmes the DMA pointers of every endpoint it knows about
+ * (endp_xfer_bufs[CONFIG_USBDEV_EP_NUM - 1], indexed up to 6), so this must
+ * cover all eight like the reference WCH configuration does. */
+#define CONFIG_USBDEV_EP_NUM    8
 
 /* VID/PID live in candleLight's config.h (USBD_VID / USBD_PID_FS); CherryUSB
  * only serves the descriptor bytes we hand it, so it needs none of them here.

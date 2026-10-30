@@ -5,8 +5,15 @@
  * (ch32_dfu_boot).  A gs_usb detach request has to land there, so set the same
  * BKP hand-shake marker the bootloader reads and reset: NVIC_SystemReset does
  * not clear the backup domain, so the marker survives.
+ *
+ * The USB link has to come down first: the bootloader starts a few hundred
+ * microseconds after the reset, and a host that never sees this device go away
+ * keeps its instance and ignores whatever attaches next.  boot_usb_port_deinit()
+ * releases D+ and holds it low for the disconnect window.
  */
 #include "ch32fun.h"
+
+#include "boot_usb_port.h"
 
 /* Same contract as ch32_dfu_boot/shared/boot_protocol.h. */
 #define BOOT_TRIGGER_MAGIC  ((uint16_t)0xDF01)
@@ -19,6 +26,8 @@ void dfu_run_bootloader(void)
     PWR->CTLR |= (1U << 8);
 
     BKP->DATAR1 = BOOT_TRIGGER_MAGIC;
+
+    boot_usb_port_deinit();
 
     NVIC_SystemReset();
 }

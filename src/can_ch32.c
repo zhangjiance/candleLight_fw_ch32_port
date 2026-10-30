@@ -42,8 +42,22 @@ static bool solve_timing(uint32_t pclk1, const can_ch32_timing_t *t,
     uint32_t best_brp = 0, best_ts1 = 0, best_ts2 = 0;
     uint32_t best_err = 0xFFFFFFFFU;
 
+    if (t->bitrate == 0U) {
+        return false;                     /* host sent no bittiming yet */
+    }
+
     for (uint32_t brp_try = 1; brp_try <= 1024U; brp_try++) {
-        const uint32_t tq = pclk1 / (t->bitrate * brp_try);   /* tq per bit */
+        const uint32_t denom = t->bitrate * brp_try;
+
+        /* The prescaler has to divide the clock exactly, otherwise the real
+         * bit rate differs from the requested one (e.g. 527 kbit/s for a
+         * 500 kbit/s request) - loopback would still work, a real bus would
+         * not. */
+        if ((pclk1 % denom) != 0U) {
+            continue;
+        }
+
+        const uint32_t tq = pclk1 / denom;                    /* tq per bit */
 
         if (tq < 8U || tq > 25U) {                            /* 1+16+8 .. sane */
             continue;
@@ -102,14 +116,40 @@ static void can_pins_init(void)
     funDigitalWrite(BOARD_CAN_RX_PIN, FUN_HIGH);
     funPinMode(BOARD_CAN_RX_PIN, GPIO_CFGLR_IN_PUPD);
 
-    /* CAN_RX = PB8, CAN_TX = PB9: CAN_RM[1:0] = 10 (the reset mapping is
-     * PA11/PA12, which is what the EVT example uses). */
+#ifndef BOARD_CAN_RM
+/*
+ * CAN_RM[1:0] pin mapping (AFIO->PCFR1 bits 14:13), from the CH32L103
+ * datasheet table "CAN1 复用功能重映射":
+ *
+ *   CAN_RM = 00 : TX = PA12, RX = PA11      (USB D+/D- pins - never use)
+ *   CAN_RM = 10 : TX = PB9,  RX = PB8       (this board)
+ *   CAN_RM = 11 : TX = PD1,  RX = PD0
+ *
+ * 01 is not defined.  A board on another pin pair overrides BOARD_CAN_RM.
+ */
+#define BOARD_CAN_RM 2U
+#endif
+
     RCC->APB2PCENR |= RCC_APB2Periph_AFIO;
-    AFIO->PCFR1 = (AFIO->PCFR1 & ~AFIO_PCFR1_CAN_RM) | AFIO_PCFR1_CAN_RM_1;
+    AFIO->PCFR1 = (AFIO->PCFR1 & ~AFIO_PCFR1_CAN_RM) |
+                  ((BOARD_CAN_RM << 13) & AFIO_PCFR1_CAN_RM);
+}
+
+static bool can_wait_inak(bool want)
+{
+    for (uint32_t guard = 200000U; guard != 0U; guard--) {
+        const bool inak = (CAN1->STATR & CAN_STATR_INAK) != 0U;
+
+        if (inak == want) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool can_ch32_init(uint32_t pclk1, const can_ch32_timing_t *nominal,
-                   const can_ch32_timing_t *data, bool fd, bool listen_only)
+                   const can_ch32_timing_t *data, bool fd,
+                   bool listen_only, bool loopback)
 {
     uint32_t brp, ts1, ts2, sjw;
 
@@ -120,23 +160,79 @@ bool can_ch32_init(uint32_t pclk1, const can_ch32_timing_t *nominal,
     fd_enabled = fd;
 
     RCC->APB1PCENR |= RCC_APB1Periph_CAN1;
+
+    /*
+     * Start-up sequence of the vendor driver (EVT ch32l103_can.c CAN_Init()).
+     * The absolute-address block below is not decoration: it is what actually
+     * brings the CANFD cell's protocol engine up.  Skipping it leaves a cell
+     * that answers register reads (BTIMR loads, ERRSR is 0) but never completes
+     * a single transmission - every frame times out and the TEC runs into
+     * bus-off, even in internal loopback.
+     */
+
+    /* RES_Exception, classical frame format. */
+    CAN1->CANFD_CR |= (1UL << 7);
+    CAN1->CANFD_CR &= ~CANFD_CR_TX_FD;
+
+    /* Reset the cell (APB1), exactly as the vendor does at the top. */
+    RCC->APB1PRSTR |= RCC_APB1Periph_CAN1;
+    RCC->APB1PRSTR &= ~RCC_APB1Periph_CAN1;
+
     can_pins_init();
 
-    /* Leave sleep, enter initialisation. */
+    /* Phase 1: leave sleep, enter initialisation, load a *valid* placeholder
+     * BTIMR (the cell needs valid timing before it can leave initialisation),
+     * then leave initialisation again. */
     CAN1->CTLR &= ~(uint32_t)CAN_CTLR_SLEEP;
     CAN1->CTLR |= CAN_CTLR_INRQ;
+    if (!can_wait_inak(true)) {
+        return false;
+    }
+    CAN1->BTIMR = 0xC1100000UL | ((pclk1 / 4000000U) - 1U);
+    CAN1->CTLR &= ~(uint32_t)CAN_CTLR_INRQ;
+    if (!can_wait_inak(false)) {
+        return false;
+    }
+
+    /* Vendor's cell-enable block (absolute addresses in the original). */
+    CAN1->FAFIFOR |= 1U;
+    CAN1->sFilterRegister[0].FR1 = 0U;
+    CAN1->sFilterRegister[0].FR2 = 0U;
+    CAN1->FWR |= 1U;
+    CAN1->FCTLR &= ~(uint32_t)CAN_FCTLR_FINIT;
+    CAN1->sTxMailBox[0].TXMIR |= 0x3U;             /* TXRQ|RTR, as shipped */
     for (uint32_t guard = 100000U; guard != 0U; guard--) {
-        if ((CAN1->STATR & CAN_STATR_INAK) != 0U) {
+        if ((CAN1->RFIFO0 & 0x3U) != 0U) {
             break;
         }
     }
+    CAN1->RFIFO0 = 0x38U;
 
-    /* Arbitration phase timing. */
-    CAN1->BTIMR = ((brp - 1U) & CAN_BTIMR_BRP) |
-                  (((uint32_t)(ts1 - 1U) << 16) & CAN_BTIMR_TS1) |
-                  (((uint32_t)(ts2 - 1U) << 20) & CAN_BTIMR_TS2) |
-                  (((uint32_t)(sjw - 1U) << 24) & CAN_BTIMR_SJW) |
-                  (listen_only ? CAN_BTIMR_SILM : 0U);
+    RCC->APB1PRSTR |= RCC_APB1Periph_CAN1;
+    RCC->APB1PRSTR &= ~RCC_APB1Periph_CAN1;
+
+    CAN1->FCTLR |= CAN_FCTLR_FINIT;
+    CAN1->FAFIFOR |= 1U;
+    CAN1->FWR |= 1U;
+    CAN1->FCTLR &= ~(uint32_t)CAN_FCTLR_FINIT;
+
+    CAN1->CANFD_CR |= (1UL << 7);
+    CAN1->CANFD_CR &= ~CANFD_CR_TX_FD;
+
+    /* Phase 2: initialise with the real timing and the requested mode. */
+    CAN1->CTLR &= ~(uint32_t)CAN_CTLR_SLEEP;
+    CAN1->CTLR |= CAN_CTLR_INRQ;
+    if (!can_wait_inak(true)) {
+        return false;
+    }
+
+    const uint32_t btimr = ((brp - 1U) & CAN_BTIMR_BRP) |
+                           (((uint32_t)(ts1 - 1U) << 16) & CAN_BTIMR_TS1) |
+                           (((uint32_t)(ts2 - 1U) << 20) & CAN_BTIMR_TS2) |
+                           (((uint32_t)(sjw - 1U) << 24) & CAN_BTIMR_SJW) |
+                           (listen_only ? CAN_BTIMR_SILM : 0U) |     /* silent       */
+                           (loopback ? CAN_BTIMR_LBKM : 0U);         /* self-receive */
+    CAN1->BTIMR = btimr;
 
     if (fd) {
         uint32_t dbrp, dts1, dts2, dsjw;
@@ -145,54 +241,36 @@ bool can_ch32_init(uint32_t pclk1, const can_ch32_timing_t *nominal,
             return false;
         }
 
-        /* Data phase timing.  CANFD_BTR is written here rather than by a vendor
-         * helper because the EVT's CANFD_Init() copies the arbitration values
-         * into it, which would force the data phase to the nominal rate. */
         CAN1->CANFD_BTR = (1UL << 23) |                                  /* TDCE  */
                           (((dbrp - 1U) << 16) & 0x001F0000U) |
                           (((dts1 - 1U) << 8) & 0x00001F00U) |
                           (((dts2 - 1U) << 4) & 0x000000F0U) |
                           ((dsjw - 1U) & 0x0000000FU);
 
-        /* Transmitter delay compensation: TDCO >= 2 (EVT note), and the filter
-         * window from the transceiver loop delay (~120 ns for a TJA1042 class
-         * part): TDC_FILTER = t_loop * f_sysclk / 3. */
         CAN1->CANFD_TDCT = (2UL) | ((4UL & 0x3FU) << 8);
-
-        /* Every mailbox may switch to the fast data phase; the transmit path
-         * picks a mailbox by the frame's BRS flag. */
-        CAN1->CANFD_CR |= CANFD_CR_TX_FD;
-        CAN1->CANFD_CR = (CAN1->CANFD_CR & ~CANFD_CR_TX_BRS_B) | (0x0EU & CANFD_CR_TX_BRS_B);
-    } else {
-        CAN1->CANFD_CR &= ~CANFD_CR_TX_FD;
+        CAN1->CANFD_CR &= ~(CANFD_CR_TX_BRS_B | CANFD_CR_USER_ESI_B);
     }
 
-    /* Accept everything: the gs_usb host configures filtering in software
-     * (candleLight's can_common), and the CAN driver here has one channel. */
+    /* Accept everything: candleLight filters in software, one channel here. */
     CAN1->FCTLR |= CAN_FCTLR_FINIT;
     for (uint32_t bank = 0; bank < 14U; bank++) {
         CAN1->sFilterRegister[bank].FR1 = 0U;
         CAN1->sFilterRegister[bank].FR2 = 0U;
     }
-    CAN1->FMCFGR = 0U;                       /* all banks: 32 bit mask mode */
+    CAN1->FMCFGR = 0U;
     CAN1->FSCFGR = 0U;
-    CAN1->FAFIFOR = 0U;                      /* all to FIFO 0 */
-    CAN1->FWR = (uint16_t)CAN_FWR_FACT;      /* activate all banks */
+    CAN1->FAFIFOR = 0U;
+    CAN1->FWR = (uint16_t)CAN_FWR_FACT;
     CAN1->FCTLR &= (uint8_t)~CAN_FCTLR_FINIT;
 
-    /* Receive payload buffers: the controller writes the frames straight into
-     * them, so hand the addresses over once. */
-    for (uint32_t i = 0; i < CAN_CH32_NUM_RX_FIFO; i++) {
-        CAN1->CANFD_DMA_R[i] = (uint32_t)(uintptr_t)rx_buf[i];
-    }
+    /* Receive payload buffer for the (single) FIFO. */
+    CAN1->CANFD_DMA_R[0] = (uint32_t)(uintptr_t)rx_buf[0];
 
-    CAN1->INTENR = 0U;                       /* polled for now */
+    CAN1->INTENR = 0U;
 
     CAN1->CTLR &= ~(uint32_t)CAN_CTLR_INRQ;
-    for (uint32_t guard = 100000U; guard != 0U; guard--) {
-        if ((CAN1->STATR & CAN_STATR_INAK) == 0U) {
-            break;
-        }
+    if (!can_wait_inak(false)) {
+        return false;
     }
 
     return true;
@@ -200,9 +278,15 @@ bool can_ch32_init(uint32_t pclk1, const can_ch32_timing_t *nominal,
 
 void can_ch32_stop(void)
 {
+    /* Keep the APB1 clock running: the host polls the controller state
+     * (GS_USB_BREQ_GET_STATE / DEVICE_STATE) even while the channel is
+     * stopped, and touching the cell with its clock gated can stall the
+     * core - which in turn stalls the USB interrupt and makes every bulk
+     * OUT transfer on EP 0x02 time out. */
+    RCC->APB1PCENR |= RCC_APB1Periph_CAN1;
+
     CAN1->CTLR |= CAN_CTLR_INRQ;
     CAN1->CTLR |= CAN_CTLR_SLEEP;
-    RCC->APB1PCENR &= ~RCC_APB1Periph_CAN1;
     fd_enabled = false;
 }
 
@@ -237,8 +321,10 @@ bool can_ch32_send(const can_ch32_frame_t *f)
         tx_buf[mb][i] = f->data[i];
     }
 
-    uint32_t mir = ((uint32_t)len_to_dlc(f->len) & 0x0FU) |
-                   (f->rtr ? (1UL << 1) : 0U) |
+    /* Identifier register: TXRQ/RTR/IDE + identifier only.  The DLC lives in
+     * TXMDTR (bxCAN TDTR[3:0]); writing it here as well used to make the
+     * controller send every classic frame with DLC 0 and no payload. */
+    uint32_t mir = (f->rtr ? (1UL << 1) : 0U) |
                    (f->extended ? (1UL << 2) : 0U);
 
     if (f->extended) {
@@ -247,11 +333,42 @@ bool can_ch32_send(const can_ch32_frame_t *f)
         mir |= (f->id & 0x7FFU) << 21;
     }
 
+    uint32_t lo = 0U;
+    uint32_t hi = 0U;
+
+    for (uint32_t i = 0U; (i < 4U) && (i < f->len); i++) {
+        lo |= (uint32_t)f->data[i] << (8U * i);
+    }
+    for (uint32_t i = 4U; (i < 8U) && (i < f->len); i++) {
+        hi |= (uint32_t)f->data[i] << (8U * (i - 4U));
+    }
+
     CAN1->sTxMailBox[mb].TXMIR   = mir;
-    CAN1->sTxMailBox[mb].TXMDTR  = 0U;
-    CAN1->sTxMailBox[mb].TXMDLR  = 0U;
-    CAN1->CANFD_DMA_T[mb]        = (uint32_t)(uintptr_t)tx_buf[mb];
-    CAN1->sTxMailBox[mb].TXMIR  |= (1UL << 0);          /* TXRQ */
+    CAN1->sTxMailBox[mb].TXMDTR  = (uint32_t)len_to_dlc(f->len) & 0x0FU;   /* DLC */
+
+    if (f->fd) {
+        /* FD frame: CANFD_CR.TX_FD selects the FD format and the payload is
+         * fetched from this mailbox's DMA buffer (vendor CANFD_Transmit()).
+         * BRS/ESI are the mailbox's own bits. */
+        const uint32_t brs_bit = 1UL << (1U + mb);
+        const uint32_t esi_bit = 1UL << (4U + mb);
+
+        CAN1->CANFD_CR |= CANFD_CR_TX_FD;
+        CAN1->CANFD_CR = (CAN1->CANFD_CR & ~(brs_bit | esi_bit)) |
+                         (f->brs ? brs_bit : 0U) | (f->esi ? esi_bit : 0U);
+        CAN1->CANFD_DMA_T[mb] = (uint32_t)(uintptr_t)tx_buf[mb];
+    } else {
+        /* Classic frame: TX_FD must be clear, otherwise the cell sends the
+         * mailbox as an FD frame and reads the payload from the DMA buffer
+         * (i.e. whatever was in it).  A classic frame carries its data in
+         * TDLR/TDHR (vendor CAN_Transmit()). */
+        CAN1->CANFD_CR &= ~CANFD_CR_TX_FD;
+        CAN1->sTxMailBox[mb].TXMDLR = lo;
+        CAN1->sTxMailBox[mb].TXMDHR = hi;
+    }
+    /* Full value again with TXRQ set: no read-modify-write on a register whose
+     * request bits read back as zero. */
+    CAN1->sTxMailBox[mb].TXMIR   = mir | (1UL << 0);
 
     return true;
 }
@@ -261,26 +378,45 @@ bool can_ch32_send(const can_ch32_frame_t *f)
 /* -------------------------------------------------------------------------- */
 static bool can_read_fifo(uint32_t fifo, can_ch32_frame_t *f)
 {
-    volatile uint32_t *rfifo = (fifo == 0U) ? &CAN1->RFIFO0 : &CAN1->RFIFO1;
+    /* One receive FIFO on this part: RFIFO0 is the only status register. */
+    volatile uint32_t *rfifo = &CAN1->RFIFO0;
+
+    (void)fifo;
 
     if ((*rfifo & CAN_RFIFO0_FMP0) == 0U) {
         return false;
     }
 
-    const uint32_t mir = CAN1->sFIFOMailBox[fifo].RXMIR;
-    const uint32_t dlc = mir & 0x0FU;
+    const uint32_t mir  = CAN1->sFIFOMailBox[fifo].RXMIR;
+    const uint32_t mdtr = CAN1->sFIFOMailBox[fifo].RXMDTR;
+
+    /* DLC, BRS and ESI live in RXMDTR (vendor CANFD_Receive()); the data
+     * registers carry the payload of a classic frame, DLC > 8 means the
+     * payload was DMA-ed into CANFD_DMA_R[fifo]. */
+    const uint32_t dlc = mdtr & 0x0FU;
 
     f->extended = ((mir >> 2) & 1U) != 0U;
     f->rtr      = ((mir >> 1) & 1U) != 0U;
     f->id       = f->extended ? ((mir >> 3) & 0x1FFFFFFFU) : ((mir >> 21) & 0x7FFU);
-    f->len      = dlc_len[dlc];
-    /* RXMIR bit0 = FDF (1 = FD frame), bit1 = RTR, bit2 = IDE (CH32L103 RM
-     * 22.8.23).  The flag is only meaningful when the controller runs in FD
-     * mode; a classic frame always reads 0 there. */
-    f->fd       = ((mir & 0x1U) != 0U);
+    f->fd       = ((mir & 0x1U) != 0U);          /* RXMIR bit0 = FDF */
+    f->brs      = ((mdtr >> 4) & 1U) != 0U;
+    f->esi      = ((mdtr >> 5) & 1U) != 0U;
+    f->len      = (uint8_t)dlc_len[dlc];
 
-    for (uint32_t i = 0; i < f->len && i < CAN_CH32_MAX_LEN; i++) {
-        f->data[i] = rx_buf[fifo][i];
+    if (dlc <= 8U) {
+        const uint32_t dlr = CAN1->sFIFOMailBox[fifo].RXMDLR;
+        const uint32_t dhr = CAN1->sFIFOMailBox[fifo].RXMDHR;
+
+        for (uint32_t i = 0U; (i < 4U) && (i < f->len); i++) {
+            f->data[i] = (uint8_t)(dlr >> (8U * i));
+        }
+        for (uint32_t i = 4U; (i < 8U) && (i < f->len); i++) {
+            f->data[i] = (uint8_t)(dhr >> (8U * (i - 4U)));
+        }
+    } else {
+        for (uint32_t i = 0U; (i < f->len) && (i < CAN_CH32_MAX_LEN); i++) {
+            f->data[i] = rx_buf[fifo][i];
+        }
     }
 
     /* Release the FIFO output mailbox. */
@@ -290,6 +426,8 @@ static bool can_read_fifo(uint32_t fifo, can_ch32_frame_t *f)
 
 bool can_ch32_receive(can_ch32_frame_t *f)
 {
+    RCC->APB1PCENR |= RCC_APB1Periph_CAN1;
+
     for (uint32_t fifo = 0; fifo < CAN_CH32_NUM_RX_FIFO; fifo++) {
         if (can_read_fifo(fifo, f)) {
             return true;
@@ -312,6 +450,8 @@ void can_ch32_irq_handler(void)
 /* -------------------------------------------------------------------------- */
 void can_ch32_get_state(can_ch32_state_t *st)
 {
+    RCC->APB1PCENR |= RCC_APB1Periph_CAN1;
+
     const uint32_t esr = CAN1->ERRSR;
 
     st->tx_error_count = (esr >> 16) & 0xFFU;

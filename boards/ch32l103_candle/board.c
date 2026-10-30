@@ -3,146 +3,136 @@
  *
  * Implements board.h on top of the peripheral registers ch32fun declares
  * (ch32l103hw.h): pins and polarity come from board_config.h, the clock tree
- * from src/funconfig.h + board.cmake.  Nothing here goes through a vendor HAL.
+ * from user/funconfig.h + board.cmake.  Nothing here goes through a vendor HAL.
  *
  * Bring-up order matters: ch32fun's handle_reset() jumps straight to main()
  * with the system clock still on HSI, so main() calls SystemInit() before
  * board_init().
  */
-#include "board_ch32.h"
+#include "board.h"
 #include "board_config.h"
 
 #include "ch32fun.h"
 
 /* HCLK cycles per millisecond, fixed by the (static) clock tree. */
-#define BOARD_CYCLES_PER_MS  (FUNCONF_SYSTEM_CORE_CLOCK / 1000U)
+static uint32_t cycles_per_ms;
 
-/* Milliseconds since boot, advanced by the SysTick compare interrupt.  Keeping
- * the time base in a 32 bit counter (instead of dividing the 64 bit SysTick CNT
- * by a non power of two) keeps libgcc's __udivdi3 out of the image: it is
- * ~940 B on this part, a fifth of the firmware. */
-static volatile uint32_t ms_ticks;
+/* the single periodic callback the application may install (may be NULL) */
+static board_tick_cb tick_cb;
 
-/* One tick per millisecond.  ch32fun's vector table holds a weak
- * SysTick_Handler, which this strong definition replaces.
- *
- * INTERRUPT_DECORATOR is what makes the compiler emit a trap return: without it
- * the function ends in `ret` and the core jumps back to whatever ra held.
- * Which decorator it expands to depends on FUNCONF_ENABLE_HPE (see
- * src/funconfig.h): with HPE the core stacks the registers in hardware and the
- * handler is a bare `mret`; without it the compiler saves the caller-saved
- * registers itself.  Both return with `mret`, both work on this part. */
-void SysTick_Handler(void) INTERRUPT_DECORATOR;
-void SysTick_Handler(void)
-{
-    SysTick->SR = 0;                        /* clear the compare flag */
-    SysTick->CMP += BOARD_CYCLES_PER_MS;
-    ms_ticks++;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Time base                                                                  */
-/* -------------------------------------------------------------------------- */
-/* SysTick counts HCLK (FUNCONF_SYSTICK_USE_HCLK) and interrupts every
- * millisecond; the handler reloads the compare value by adding one period, so
- * the base stays aligned to the counter without ever being restarted. */
+/*
+ * SysTick is a free running 64bit up counter on the CH32L103 and is used as the
+ * millisecond time base without an interrupt (the same scheme as the CH32V30x
+ * board).  Only the low 32 bits are read: at 96 MHz that wraps every ~44 s,
+ * which board_delay_ms()'s wrapping subtraction copes with, and it keeps the
+ * divide out of libgcc (both operands stay 32 bit, so no __udivdi3).
+ */
 static void board_init_systick(void)
 {
+    cycles_per_ms = (uint32_t)(FUNCONF_SYSTEM_CORE_CLOCK / 1000U);
+
     SysTick->CTLR = 0;
     SysTick->SR = 0;
     SysTick->CNT = 0;
-    SysTick->CMP = BOARD_CYCLES_PER_MS;
-
-    NVIC_EnableIRQ(SysTick_IRQn);
-    SysTick->CTLR = 7;                      /* STE | STIE | STCLK (HCLK) */
+    SysTick->CMP = 0xffffffffffffffffull;
+    SysTick->CTLR = 1 | (1 << 2);   /* STE | STCLK: count at HCLK */
 }
 
 uint32_t board_time_ms(void)
 {
-    return ms_ticks;
+    return (uint32_t)SysTick->CNT / cycles_per_ms;
 }
 
 void board_delay_ms(uint32_t ms)
 {
-    const uint32_t start = ms_ticks;
+    uint32_t start = board_time_ms();
 
-    while ((uint32_t)(ms_ticks - start) < ms) {
+    while ((uint32_t)(board_time_ms() - start) < ms) {
+        continue;
     }
 }
 
 /* -------------------------------------------------------------------------- */
-/* LEDs                                                                       */
+/* Status LED (LED1 of the board)                                             */
 /* -------------------------------------------------------------------------- */
-static void board_led_pin_init(uint32_t pin)
+#if BOARD_HAS_LED
+static uint8_t led_level(uint8_t on)
 {
+    return BOARD_LED_ACTIVE_LOW ? (uint8_t)!on : on;
+}
+
+static void board_init_led(void)
+{
+    RCC->APB2PCENR |= BOARD_GPIO_RCC;
+
     /* Preload the off level (BOARD_LED_ACTIVE_LOW aware) in the output latch
      * before the pin becomes an output, so the LED does not flash on. */
-    const uint8_t off = BOARD_LED_ACTIVE_LOW ? 1U : 0U;
+    funDigitalWrite(BOARD_LED_PIN, led_level(0U) ? FUN_HIGH : FUN_LOW);
 
-    funDigitalWrite(pin, off ? FUN_HIGH : FUN_LOW);
-    funPinMode(pin, GPIO_CFGLR_OUT_10Mhz_PP);
+    funPinMode(BOARD_LED_PIN, GPIO_CFGLR_OUT_10Mhz_PP);
 }
-
-static void board_led_pin_write(uint32_t pin, uint8_t on, uint8_t active_low)
-{
-    const uint8_t level = active_low ? (uint8_t)!on : on;
-
-    funDigitalWrite(pin, level ? FUN_HIGH : FUN_LOW);
-}
-
-void board_led1_write(uint8_t on)
-{
-#if BOARD_HAS_LED1
-    board_led_pin_write(BOARD_LED1_PIN, on != 0U, BOARD_LED_ACTIVE_LOW);
-#else
-    (void)on;
-#endif
-}
-
-void board_led2_write(uint8_t on)
-{
 #if BOARD_HAS_LED2
-    board_led_pin_write(BOARD_LED2_PIN, on != 0U, BOARD_LED_ACTIVE_LOW);
+/* Second LED (LED2).  Same off-level convention as LED1; a board whose second
+ * LED has the opposite polarity overrides it with BOARD_LED2_ACTIVE_LOW. */
+#ifndef BOARD_LED2_ACTIVE_LOW
+#define BOARD_LED2_ACTIVE_LOW BOARD_LED_ACTIVE_LOW
+#endif
+
+static uint8_t led2_level(uint8_t on)
+{
+    return BOARD_LED2_ACTIVE_LOW ? (uint8_t)!on : on;
+}
+
+static void board_init_led2(void)
+{
+    RCC->APB2PCENR |= BOARD_GPIO_RCC;
+
+    /* Preload the off level before the pin becomes an output, so the LED does
+     * not flash on at boot.  Without this the second LED stays an input and the
+     * application's TX/RX indicators never light. */
+    funDigitalWrite(BOARD_LED2_PIN, led2_level(0U) ? FUN_HIGH : FUN_LOW);
+
+    funPinMode(BOARD_LED2_PIN, GPIO_CFGLR_OUT_10Mhz_PP);
+}
+#endif /* BOARD_HAS_LED2 */
+#endif /* BOARD_HAS_LED */
+
+void board_led_write(uint8_t state)
+{
+#if BOARD_HAS_LED
+    const uint8_t level = led_level((state != 0U) ? 1U : 0U);
+
+    funDigitalWrite(BOARD_LED_PIN, level ? FUN_HIGH : FUN_LOW);
 #else
-    (void)on;
+    (void)state;
 #endif
 }
 
-void board_led1_toggle(void)
+void board_led_toggle(void)
 {
-#if BOARD_HAS_LED1
+#if BOARD_HAS_LED
     static uint8_t on;
 
     on ^= 1U;
-    board_led1_write(on);
-#endif
-}
-
-void board_led2_toggle(void)
-{
-#if BOARD_HAS_LED2
-    static uint8_t on;
-
-    on ^= 1U;
-    board_led2_write(on);
+    board_led_write(on);
 #endif
 }
 
 /* -------------------------------------------------------------------------- */
-/* Transceiver termination                                                    */
+/* CAN transceiver termination                                                */
 /* -------------------------------------------------------------------------- */
+#if BOARD_HAS_TERMINATION
 static bool termination_on;
+
+static uint8_t term_level(bool on)
+{
+    return BOARD_TERM_ACTIVE_LOW ? (uint8_t)!on : (uint8_t)on;
+}
 
 void board_set_termination(bool on)
 {
-#if BOARD_HAS_TERMINATION
-    const uint8_t level = BOARD_TERM_ACTIVE_LOW ? (on ? 0U : 1U) : (on ? 1U : 0U);
-
     termination_on = on;
-    funDigitalWrite(BOARD_TERM_PIN, level ? FUN_HIGH : FUN_LOW);
-#else
-    (void)on;
-#endif
+    funDigitalWrite(BOARD_TERM_PIN, term_level(on) ? FUN_HIGH : FUN_LOW);
 }
 
 bool board_get_termination(void)
@@ -150,30 +140,138 @@ bool board_get_termination(void)
     return termination_on;
 }
 
+static void board_init_termination(void)
+{
+    RCC->APB2PCENR |= BOARD_GPIO_RCC;
+
+    /* Off by default, like the application's board: the host turns it on, and
+     * an unpowered bus with 120 ohm across it is better than a second
+     * terminator on a bus that already has one.  Preload the level before the
+     * pin becomes an output. */
+    funPinMode(BOARD_TERM_PIN, GPIO_CFGLR_OUT_10Mhz_PP);
+    board_set_termination(false);
+}
+#else /* !BOARD_HAS_TERMINATION */
+void board_set_termination(bool on)
+{
+    (void)on;
+}
+
+bool board_get_termination(void)
+{
+    return false;
+}
+#endif /* BOARD_HAS_TERMINATION */
+
+
+/* -------------------------------------------------------------------------- */
+/* BOOT button                                                                */
+/* -------------------------------------------------------------------------- */
+#if BOARD_HAS_BOOT_BUTTON
+static void board_init_boot_button(void)
+{
+    RCC->APB2PCENR |= BOARD_GPIO_RCC;
+
+    /* The pull direction of a GPIO_CFGLR_IN_PUPD pin is the output latch:
+     * 1 = pull-up.  The released level must be the "run the application"
+     * level. */
+    if (BOARD_BOOT_ACTIVE_LOW) {
+        funDigitalWrite(BOARD_BOOT_PIN, FUN_HIGH);   /* pull-up */
+    } else {
+        funDigitalWrite(BOARD_BOOT_PIN, FUN_LOW);    /* pull-down */
+    }
+    funPinMode(BOARD_BOOT_PIN, GPIO_CFGLR_IN_PUPD);
+}
+#endif /* BOARD_HAS_BOOT_BUTTON */
+
+bool board_read_boot_pin(void)
+{
+#if BOARD_HAS_BOOT_BUTTON
+    const bool level = funDigitalRead(BOARD_BOOT_PIN) != 0;
+
+    return BOARD_BOOT_ACTIVE_LOW ? !level : level;
+#else
+    return false;
+#endif
+}
+
+/* -------------------------------------------------------------------------- */
+/* Application UART                                                           */
+/* -------------------------------------------------------------------------- */
+void board_init_app_uart(void)
+{
+#if BOARD_HAS_APP_UART
+    RCC->APB2PCENR |= BOARD_GPIO_RCC;
+    RCC->APB1PCENR |= BOARD_APP_UART_RCC;
+
+    /* TX idle high before the alternate function takes over, so the line does
+     * not glitch low (the far end would read that as a start bit). */
+    funDigitalWrite(BOARD_APP_UART_TX_PIN, FUN_HIGH);
+    funPinMode(BOARD_APP_UART_TX_PIN, GPIO_CFGLR_OUT_50Mhz_AF_PP);
+
+    /* RX with pull-up. */
+    funDigitalWrite(BOARD_APP_UART_RX_PIN, FUN_HIGH);
+    funPinMode(BOARD_APP_UART_RX_PIN, GPIO_CFGLR_IN_PUPD);
+#endif /* BOARD_HAS_APP_UART */
+}
+
+/* -------------------------------------------------------------------------- */
+/* Periodic tick                                                              */
+/* -------------------------------------------------------------------------- */
+void board_timer_create(uint32_t ms, board_tick_cb cb)
+{
+    tick_cb = cb;
+
+    /*
+     * Periodic update interrupt on the board's tick timer.  The prescaler gives
+     * a 10 kHz tick so the period only depends on the milliseconds asked for,
+     * independent of the clock (the TIM2..TIM4 cells count HCLK, which is what
+     * the WCH examples prescale from too).
+     */
+    RCC->APB1PCENR |= BOARD_TICK_TIM_RCC;
+
+    BOARD_TICK_TIM->PSC    = (uint16_t)((FUNCONF_SYSTEM_CORE_CLOCK / 10000U) - 1U);
+    BOARD_TICK_TIM->ATRLR  = (uint16_t)((10000U * ms / 1000U) - 1U);
+    BOARD_TICK_TIM->CNT    = 0;
+    BOARD_TICK_TIM->INTFR  = (uint16_t)~TIM_FLAG_Update;
+    BOARD_TICK_TIM->DMAINTENR |= TIM_IT_Update;
+    NVIC_EnableIRQ(BOARD_TICK_TIM_IRQ);
+    BOARD_TICK_TIM->CTLR1 |= TIM_CEN;
+}
+
+void BOARD_TICK_TIM_ISR(void) INTERRUPT_DECORATOR;
+void BOARD_TICK_TIM_ISR(void)
+{
+    if ((BOARD_TICK_TIM->INTFR & TIM_FLAG_Update) == 0U) {
+        return;
+    }
+    BOARD_TICK_TIM->INTFR = (uint16_t)~TIM_FLAG_Update;
+
+    if (tick_cb) {
+        tick_cb();
+    }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Bring-up                                                                   */
 /* -------------------------------------------------------------------------- */
 void board_init(void)
 {
-    /* Same priority grouping the other projects use: two pre-emption bits, so
-     * USB and the CAN interrupt keep their default levels. */
+    /* Same priority grouping the other CH32 projects use: two pre-emption
+     * bits, so USB and the tick keep their default levels. */
     PFIC->CFGR = 0x500U;
 
-    funGpioInitAll();
-
-#if BOARD_HAS_LED1
-    board_led_pin_init(BOARD_LED1_PIN);
+#if BOARD_HAS_LED
+    board_init_led();
 #endif
 #if BOARD_HAS_LED2
-    board_led_pin_init(BOARD_LED2_PIN);
+    board_init_led2();
 #endif
-
 #if BOARD_HAS_TERMINATION
-    /* Off by default: the host enables it through gs_usb, and an unpowered bus
-     * with 120 ohm across it is better than a second terminator on a bus that
-     * already has one. */
-    funPinMode(BOARD_TERM_PIN, GPIO_CFGLR_OUT_10Mhz_PP);
-    board_set_termination(false);
+    board_init_termination();
+#endif
+#if BOARD_HAS_BOOT_BUTTON
+    board_init_boot_button();
 #endif
 
     board_init_systick();

@@ -28,8 +28,18 @@ const struct board_config config = {
         {
             .interface = CAN1,
             .leds = {
-                [LED_RX] = { .port = GPIOA, .pin = 0U, .active_high = false },  /* LED1 = PA0 */
-                [LED_TX] = { .port = GPIOA, .pin = 1U, .active_high = false },  /* LED2 = PA1 */
+                /* The pin facts live in boards/<board>/board_config.h, the same
+                 * file the other CH32 projects use. */
+                [LED_RX] = {
+                    .port = GpioOf(BOARD_LED_PIN),
+                    .pin = (uint16_t)(BOARD_LED_PIN & 0xFU),
+                    .active_high = (BOARD_LED_ACTIVE_LOW == 0),
+                },
+                [LED_TX] = {
+                    .port = GpioOf(BOARD_LED2_PIN),
+                    .pin = (uint16_t)(BOARD_LED2_PIN & 0xFU),
+                    .active_high = (BOARD_LED_ACTIVE_LOW == 0),
+                },
             },
         },
     },

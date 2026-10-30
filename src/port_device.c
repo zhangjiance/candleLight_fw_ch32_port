@@ -12,6 +12,7 @@
 #include "board_ch32.h"
 #include "board_config.h"
 #include "board_layout.h"
+#include "boot_usb_port.h"
 #include "hal_include.h"
 #include "timer.h"
 
@@ -28,17 +29,56 @@ static void ch32_uid_load(void)
     }
 }
 
+/*
+ * Put SYSCLK back on HSI before SystemInit() rebuilds the clock tree.
+ *
+ * The application is entered from the DFU bootloader by a jump, with SYSCLK
+ * already on the bootloader's PLL, and ch32fun's SystemInit() stops PLLON with
+ * its very first write - without this the core would run out of clock in the
+ * middle of SystemInit().  Safe on a power-on reset: SW already selects HSI and
+ * the loops below exit at once.
+ */
+static void clock_fallback_to_hsi(void)
+{
+    RCC->CTLR |= RCC_HSION;
+    while ((RCC->CTLR & RCC_HSIRDY) == 0U) {
+    }
+
+    RCC->CFGR0 &= ~RCC_SW;                          /* SW = HSI             */
+    while ((RCC->CFGR0 & RCC_SWS) != 0U) {          /* wait for SWS = HSI   */
+    }
+}
+
 void HAL_Init(void)
 {
-    /* Clock tree, GPIO and the millisecond tick come from the board layer; main()
-     * has already run SystemInit() before this. */
-    board_init();
+    /*
+     * ch32fun's handle_reset() jumps straight to main() with the clock still on
+     * HSI, and candleLight's main() never calls SystemInit() itself, so it has
+     * to happen here - before anything that depends on the clock tree.  Without
+     * it SYSCLK stays on HSI, the PLL never starts, and the USBFS gets no 48 MHz
+     * (PLL/2), i.e. the device never enumerates; the millisecond tick and the
+     * CAN bit timing would be wrong by the same factor.
+     */
+    /* Two blinks = main() is running.  Placed before anything that can hang
+     * and before USB comes up, so it cannot disturb enumeration. */
 
+    clock_fallback_to_hsi();
+    SystemInit();
+    /* GPIO and the millisecond tick come from the board layer. */
+    board_init();
     ch32_uid_load();
+
+    /* Hand-over from the bootloader: the host has to see this device go away
+     * before the application attaches, or it keeps the bootloader's instance
+     * and the new device never enumerates.  Release D+ (which on this part also
+     * drives the line low), wait past the host's 10 ms disconnect window, then
+     * attach below. */
+    boot_usb_port_deinit();
+    board_delay_ms(20);
 
     /* USBFS clock/PLL and the pins are brought up by the controller driver's
      * low-level hook when the stack is initialised (see usb_dc_low_level_init
-     * in port/ch32/ch32usb.c). */
+     * in port/ch32l103/boot_usb_ch32l103.c). */
 }
 
 void device_sysclock_config(void)

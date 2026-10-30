@@ -56,6 +56,8 @@ endif()
 # (src/usbd_bridge.c + the submodule's usbd_gs_can.c), so no class from the
 # stack is selected here.
 set(CONFIG_CHERRYUSB_DEVICE 1)
+# No CherryUSB device class is built: the gs_usb device lives in
+# src/candle/usbd_gs_can.c, on top of the CherryUSB core.
 
 # ------------------------------------------------------------------------------
 # Board selection
@@ -105,10 +107,10 @@ add_executable(${PROJECT_TARGET})
 target_sources(${PROJECT_TARGET} PRIVATE
     # ch32fun: startup, clock tree, SysTick and printf
     ${CH32FUN_ROOT}/ch32fun/ch32fun.c
-    # CherryUSB core + the CH32 USBFS device controller (our copy of the
-    # upstream port, see port/ch32/ch32fs/usb_dc_usbfs.c)
+    # CherryUSB core + its WCH USBFS device controller (same submodule, same
+    # commit and same driver as the bootloader and the hello_world application)
     ${cherryusb_srcs}
-    ${CMAKE_CURRENT_SOURCE_DIR}/port/ch32/ch32fs/usb_dc_usbfs.c
+    ${CHERRYUSB_ROOT}/port/wch/usbfs/usb_dc_usbfs.c
     # board primitives
     ${BOARD_DIR}/board.c
     # candleLight core, verbatim from the submodule
@@ -121,26 +123,35 @@ target_sources(${PROJECT_TARGET} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/candle/can_common.c
     # CH32 platform layer
     ${CMAKE_CURRENT_SOURCE_DIR}/src/usbd_bridge.c
+    # src/usb_cdc_only.c - the minimal CDC ACM bring-up device - is not compiled
+    # any more; the file stays next to the gs_usb path for the next bring-up.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/port_device.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/port_board.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/timer.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/status_led.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dfu_ch32.c
-    # overrides the weak USBFS clock/pin hooks of the CherryUSB CH32 driver
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/usb_lowlevel_ch32.c
+    # hard fault -> fast LED blink, so an exception is not mistaken for a hang
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/fault_ch32.c
+    # USBFS clock/attach/detach + the hard D+ disconnect used for the
+    # hand-over; the same file the bootloader and the hello_world application
+    # use (boards/<board>/ is shared the same way)
+    ${CMAKE_CURRENT_SOURCE_DIR}/port/ch32l103/boot_usb_ch32l103.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/can_ch32.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/can_ch32_adapter.c
 )
 
 target_include_directories(${PROJECT_TARGET} PRIVATE
     ${CH32FUN_ROOT}/ch32fun
+    # for BOARD_PRIMITIVE_HEADER ("boards/<board>/board.h", the shared board
+    # package - see port/board_ch32.h for why it is not included as board.h)
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/port
     ${CANDLE_ROOT}/include
     ${CANDLE_ROOT}/src
     ${CANDLE_ROOT}/libs/STM32_USB_Device_Library/config
     ${cherryusb_incs}
-    # register map for the vendored USBFS driver (upstream copy)
-    ${CHERRYUSB_ROOT}/port/ch32/ch32fs
+    # register map for the USBFS driver above
+    ${CHERRYUSB_ROOT}/port/wch/usbfs
     ${BOARD_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/shared
@@ -148,6 +159,7 @@ target_include_directories(${PROJECT_TARGET} PRIVATE
 
 target_compile_definitions(${PROJECT_TARGET} PRIVATE
     BOARD_${_board_macro}=1
+    BOARD_PRIMITIVE_HEADER="boards/${BOARD}/board.h"
     GIT_HASH="ch32l103-port"
     $<$<CONFIG:Debug>:BOOT_ENABLE_LOG=1>
 )

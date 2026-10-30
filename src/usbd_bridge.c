@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "usbd_core.h"
+#include "usb_dc.h"
 #include "usb_config.h"
 
 #include "ch32fun.h"
@@ -315,6 +316,7 @@ static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_tx_bounce[GSUSB_TX_BOUNC
 
 static volatile uint32_t g_ep_out_last_len;
 
+
 /* ------------------------------------------------------------------ */
 /* Control helpers (STM32 usbd_ctlreq / usbd_ioreq)                   */
 /* ------------------------------------------------------------------ */
@@ -375,13 +377,28 @@ void USBD_GetString(uint8_t *desc, uint8_t *unicode, uint16_t *len)
 /* ------------------------------------------------------------------ */
 USBD_StatusTypeDef USBD_LL_OpenEP(USBD_HandleTypeDef *pdev, uint8_t ep_addr, uint8_t ep_type, uint16_t ep_mps)
 {
-    /* CherryUSB opens the endpoints while parsing the configuration. */
     (void)pdev;
-    (void)ep_addr;
-    (void)ep_type;
-    (void)ep_mps;
 
-    return USBD_OK;
+    /*
+     * This is where the class API enables an endpoint - candleLight's
+     * USBD_GS_CAN_Start() calls it for EP 0x81 and 0x02 on every CONFIGURED,
+     * right before it arms the OUT endpoint.  Returning USBD_OK without doing
+     * anything (as this shim used to) leaves UEP*_MOD clear, so the USBFS
+     * controller NAKs every bulk OUT and the host times out after 1500 ms.
+     *
+     * CherryUSB's controller driver wants a full endpoint descriptor, so build
+     * one from the three arguments the class passes.
+     */
+    const struct usb_endpoint_descriptor ep = {
+        .bLength          = USB_SIZEOF_ENDPOINT_DESC,
+        .bDescriptorType  = USB_DESCRIPTOR_TYPE_ENDPOINT,
+        .bEndpointAddress = ep_addr,
+        .bmAttributes     = ep_type,
+        .wMaxPacketSize   = ep_mps,
+        .bInterval        = 0U,
+    };
+
+    return (usbd_ep_open(0U, &ep) == 0) ? USBD_OK : USBD_FAIL;
 }
 
 USBD_StatusTypeDef USBD_LL_CloseEP(USBD_HandleTypeDef *pdev, uint8_t ep_addr)
@@ -412,7 +429,9 @@ USBD_StatusTypeDef USBD_LL_PrepareReceive(USBD_HandleTypeDef *pdev, uint8_t ep_a
 {
     (void)pdev;
 
-    if (usbd_ep_start_read(0U, ep_addr, pbuf, size) != 0) {
+    const int ret = usbd_ep_start_read(0U, ep_addr, pbuf, size);
+
+    if (ret != 0) {
         return USBD_FAIL;
     }
 
@@ -536,6 +555,7 @@ static void gs_bridge_notify(uint8_t busid, uint8_t event, void *arg)
         break;
     }
 }
+
 
 static void gs_bridge_event(uint8_t busid, uint8_t event)
 {

@@ -30,8 +30,8 @@ set(CMAKE_SIZE                      ${TOOLCHAIN_PREFIX}size)
 
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
-set(CMAKE_C_FLAGS_DEBUG "-Og -g3")
-set(CMAKE_C_FLAGS_RELEASE "-O3 -flto -g0")
+set(CMAKE_C_FLAGS_DEBUG "-Os -g3")
+set(CMAKE_C_FLAGS_RELEASE "-Os -flto -g0")
 
 add_compile_options(
         -fmessage-length=0

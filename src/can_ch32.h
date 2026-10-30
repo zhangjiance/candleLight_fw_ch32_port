@@ -25,7 +25,9 @@
 
 #define CAN_CH32_MAX_LEN     64U
 #define CAN_CH32_NUM_TX_MB   3U
-#define CAN_CH32_NUM_RX_FIFO 2U
+/* The CH32L103 CANFD cell has one receive FIFO (CANFD_DMA_R[1], RFIFO0
+ * only) - the vendor struct has no RFIFO1/DMA_R[1]. */
+#define CAN_CH32_NUM_RX_FIFO 1U
 
 /* One frame in either direction; len is the real byte count (0..64), fd tells
  * whether it is an FD frame, brs whether the data phase switched rate. */
@@ -50,11 +52,21 @@ typedef struct {
 /* Bring the controller up.  pclk1 is the APB1 clock the CAN cell runs from.
  * data is ignored when fd is false.  Returns false if the timing could not be
  * represented in the hardware (wrong clock or impossible sample point). */
+/* listen_only : BTIMR.SILM - receive only, never drive the bus.
+ * loopback    : BTIMR.LBKM - the controller receives its own frames internally,
+ *               so a node without a transceiver (bench board) can still transmit
+ *               and see the frames come back on the RX path. */
 bool can_ch32_init(uint32_t pclk1,
                    const can_ch32_timing_t *nominal,
                    const can_ch32_timing_t *data,
                    bool fd,
-                   bool listen_only);
+                   bool listen_only,
+                   bool loopback);
+
+/* True once can_ch32_init() ran with fd == true and succeeded.  The bench
+ * transmitter uses it to fall back to a classic frame if the FD
+ * initialisation did not take. */
+bool can_ch32_fd_enabled(void);
 
 void can_ch32_stop(void);
 

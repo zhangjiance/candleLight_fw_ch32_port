@@ -34,9 +34,17 @@ static void bt_from_gs(const struct gs_device_bittiming *bt, can_ch32_timing_t *
 /* -------------------------------------------------------------------------- */
 /* can.h                                                                      */
 /* -------------------------------------------------------------------------- */
+
 void can_init(can_data_t *channel, const struct board_channel_config *config)
 {
     memset(channel, 0, sizeof(*channel));
+
+    /* can_channel owns state that is already live when can_init() is called:
+     * the firmware initialises list_from_host before handing the channel over,
+     * and can_disable() - called right after this - walks that list to purge
+     * pending frames.  memset() would leave next/prev at NULL and the purge
+     * would then follow garbage, so restore the head immediately. */
+    INIT_LIST_HEAD(&channel->list_from_host);
 
 #if defined(CONFIG_BXCAN)
     channel->instance = config->interface;
@@ -44,7 +52,7 @@ void can_init(can_data_t *channel, const struct board_channel_config *config)
     channel->instance = CAN1;
 #endif
 
-    channel->state  = GS_CAN_STATE_STOPPED;
+    channel->state   = GS_CAN_STATE_STOPPED;
     channel->feature = 0U;
 
     led_init(&channel->leds,
@@ -52,13 +60,41 @@ void can_init(can_data_t *channel, const struct board_channel_config *config)
              config->leds[LED_TX].port, config->leds[LED_TX].pin, config->leds[LED_TX].active_high);
 }
 
+/*
+ * One frame of lookahead: can_is_rx_pending() has to answer without consuming
+ * the frame (it used to pull one out of the controller and drop it), so
+ * whatever it takes is handed over to the next can_receive() call.
+ */
+static can_ch32_frame_t g_rx_next;
+static bool g_rx_next_valid;
+
+static bool adapter_rx_peek(void)
+{
+    if (g_rx_next_valid) {
+        return true;
+    }
+
+    g_rx_next_valid = can_ch32_receive(&g_rx_next);
+
+    return g_rx_next_valid;
+}
+
+static bool adapter_rx_pop(can_ch32_frame_t *f)
+{
+    if (adapter_rx_peek()) {
+        *f = g_rx_next;
+        g_rx_next_valid = false;
+        return true;
+    }
+
+    return false;
+}
+
 bool can_is_rx_pending(can_data_t *channel)
 {
     (void)channel;
 
-    can_ch32_frame_t f;
-
-    return can_ch32_receive(&f);
+    return adapter_rx_peek();
 }
 
 bool can_receive(can_data_t *channel, struct gs_host_frame *rx_frame)
@@ -67,7 +103,7 @@ bool can_receive(can_data_t *channel, struct gs_host_frame *rx_frame)
 
     (void)channel;
 
-    if (!can_ch32_receive(&f)) {
+    if (!adapter_rx_pop(&f)) {
         return false;
     }
 
@@ -113,9 +149,37 @@ bool can_send(can_data_t *channel, struct gs_host_frame *frame)
 /* -------------------------------------------------------------------------- */
 /* can_drv.h                                                                  */
 /* -------------------------------------------------------------------------- */
+
+/*
+ * The controller itself is brought up from the main loop (can_drv_poll()), not
+ * from here: can_drv_enable() runs inside the USB interrupt (the gs_usb class
+ * handles GS_USB_BREQ_MODE there), and anything slow or blocking in that
+ * context stalls EP0/EP2 handling - the host then reports "bulk TX timeout on
+ * EP 0x2" even though the frame never reached us.
+ */
+static volatile bool s_start_pending;
+
 void can_drv_enable(can_data_t *channel)
 {
+    channel->state = GS_CAN_STATE_ERROR_ACTIVE;
+    led_set_mode(&channel->leds, LED_MODE_NORMAL);
+    s_start_pending = true;
+}
+
+/* Called from the main loop: performs the deferred controller start. */
+void can_drv_poll(can_data_t *channel)
+{
     can_ch32_timing_t nom, dat;
+
+    if (!s_start_pending) {
+        return;
+    }
+    s_start_pending = false;
+
+    /* Controller mode comes straight from the gs_usb MODE_START request (Linux:
+     * `ip link set can0 type can ... loopback on` / `listen-only on`). */
+    const bool listen_only = (channel->feature & GS_CAN_FEATURE_LISTEN_ONLY) != 0U;
+    const bool loopback    = (channel->feature & GS_CAN_FEATURE_LOOP_BACK) != 0U;
 
     bt_from_gs(&channel->bittiming, &nom);
 #if defined(CONFIG_CANFD)
@@ -124,7 +188,7 @@ void can_drv_enable(can_data_t *channel)
     dat = nom;
 #endif
 
-    if (!can_ch32_init(CAN_CLOCK_SPEED, &nom, &dat, true, false)) {
+    if (!can_ch32_init(CAN_CLOCK_SPEED, &nom, &dat, true, listen_only, loopback)) {
         channel->state = GS_CAN_STATE_ERROR_PASSIVE;
         return;
     }
@@ -135,7 +199,11 @@ void can_drv_enable(can_data_t *channel)
 
 void can_drv_disable(can_data_t *channel)
 {
+    s_start_pending = false;
+    g_rx_next_valid = false;
+
     can_ch32_stop();
+
     channel->state = GS_CAN_STATE_STOPPED;
     led_set_mode(&channel->leds, LED_MODE_OFF);
 }
@@ -167,11 +235,12 @@ bool can_drv_handle_bus_error(const can_data_t *channel, struct gs_host_frame *f
 
 enum gs_can_state can_drv_get_state(const can_data_t *channel)
 {
-    (void)channel;
-
     can_ch32_state_t st;
 
+    (void)channel;
+
     can_ch32_get_state(&st);
+
     if (st.bus_off) {
         return GS_CAN_STATE_BUS_OFF;
     }
@@ -181,6 +250,7 @@ enum gs_can_state can_drv_get_state(const can_data_t *channel)
     if (st.warning) {
         return GS_CAN_STATE_ERROR_WARNING;
     }
+
     return GS_CAN_STATE_ERROR_ACTIVE;
 }
 
@@ -205,6 +275,24 @@ void can_drv_handle_state_change(const can_data_t *channel, struct gs_host_frame
 void can_drv_handle_bus_off_recovery(can_data_t *channel)
 {
     (void)channel;
+
+    /* bxCAN-style recovery: re-enter initialisation and leave it again.  That is
+     * what clears the bus-off state when ABOM is off, which is candleLight's
+     * model (the host asks for the restart). */
+    RCC->APB1PCENR |= RCC_APB1Periph_CAN1;
+
+    CAN1->CTLR |= CAN_CTLR_INRQ;
+    for (uint32_t guard = 100000U; guard != 0U; guard--) {
+        if ((CAN1->STATR & CAN_STATR_INAK) != 0U) {
+            break;
+        }
+    }
+    CAN1->CTLR &= ~(uint32_t)CAN_CTLR_INRQ;
+    for (uint32_t guard = 100000U; guard != 0U; guard--) {
+        if ((CAN1->STATR & CAN_STATR_INAK) == 0U) {
+            break;
+        }
+    }
 }
 
 void can_drv_get_device_tdc(const can_data_t *channel, struct gs_device_tdc *tdc)
