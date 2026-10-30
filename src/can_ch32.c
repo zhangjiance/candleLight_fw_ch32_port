@@ -301,7 +301,7 @@ static void timing_store(can_ch32_timing_t *t, uint32_t brp, uint32_t ts1,
 bool can_ch32_init(uint32_t pclk1, can_ch32_timing_t *nominal,
                    can_ch32_timing_t *data, bool fd,
                    bool listen_only, bool loopback,
-                   bool tdc_set, uint8_t tdco, uint8_t tdcf)
+                   bool tdc_off, bool tdc_set, uint8_t tdco, uint8_t tdcf)
 {
     uint32_t brp, ts1, ts2, sjw;
 
@@ -420,8 +420,11 @@ bool can_ch32_init(uint32_t pclk1, can_ch32_timing_t *nominal,
          * TDC is a transmitter-local mechanism: it does not have to match
          * the peer (PCAN, another candleLight, ...), only the bitrate and
          * sample point do.  The hard rule is the DBRP <= 2 limit above.
+         *
+         * A host SET_TDC with mode OFF disables TDC unconditionally.
          */
-        const bool tdce = (data->bitrate > nominal->bitrate) &&
+        const bool tdce = !tdc_off &&
+                          (data->bitrate > nominal->bitrate) &&
                           (data->bitrate >= 2000000U) &&
                           (dbrp <= 2U);
 

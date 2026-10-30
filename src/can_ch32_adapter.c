@@ -227,8 +227,12 @@ void can_drv_poll(can_data_t *channel)
     const bool loopback    = (channel->feature & GS_CAN_FEATURE_LOOP_BACK) != 0U;
 
     /* TDC parameters configured by the host (SET_TDC); otherwise the driver
-     * picks the defaults (offset = data-phase SEG1). */
-    const bool tdc_set = (channel->flags & CAN_CHANNEL_FLAG_TDC_SET) != 0U;
+     * picks the defaults (offset = data-phase SEG1).  An explicit mode OFF
+     * disables TDC even though the host did send a SET_TDC request. */
+    const bool tdc_configured = (channel->flags & CAN_CHANNEL_FLAG_TDC_SET) != 0U;
+    const bool tdc_off = tdc_configured &&
+                         (channel->tdc.mode == GS_CAN_TDC_MODE_OFF);
+    const bool tdc_set = tdc_configured && !tdc_off;
 
     bt_from_gs(&channel->bittiming, &nom);
 #if defined(CONFIG_CANFD)
@@ -238,7 +242,8 @@ void can_drv_poll(can_data_t *channel)
 #endif
 
     if (!can_ch32_init(CAN_CLOCK_SPEED, &nom, &dat, true, listen_only, loopback,
-                        tdc_set, (uint8_t)channel->tdc.tdco, (uint8_t)channel->tdc.tdcf)) {
+                        tdc_off, tdc_set,
+                        (uint8_t)channel->tdc.tdco, (uint8_t)channel->tdc.tdcf)) {
         s_controller_ready = false;
         channel->state = GS_CAN_STATE_ERROR_PASSIVE;
         return;

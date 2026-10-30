@@ -65,13 +65,17 @@ typedef struct {
 /* listen_only : BTIMR.SILM - receive only, never drive the bus.
  * loopback    : BTIMR.LBKM - the controller receives its own frames internally,
  *               so a node without a transceiver (bench board) can still transmit
- *               and see the frames come back on the RX path. */
+ *               and see the frames come back on the RX path.
+ * tdc_off     : host explicitly disabled TDC (SET_TDC mode = OFF).
+ * tdc_set     : host supplied TDCO/TDCF via SET_TDC; otherwise the driver
+ *               picks its defaults. */
 bool can_ch32_init(uint32_t pclk1,
                    can_ch32_timing_t *nominal,
                    can_ch32_timing_t *data,
                    bool fd,
                    bool listen_only,
                    bool loopback,
+                   bool tdc_off,
                    bool tdc_set,
                    uint8_t tdco,
                    uint8_t tdcf);
