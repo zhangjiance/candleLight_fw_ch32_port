@@ -63,7 +63,8 @@
 #define FUNCONF_ENABLE_HPE 1
 #endif
 
-/* SysTick counts HCLK cycles; it is the time base for gs_usb timestamps. */
+/* The board owns a 1 ms TIM3 tick as the time base (see boards/.../board.c);
+ * SysTick is not used by the application. */
 #define FUNCONF_SYSTICK_USE_HCLK 1
 
 /* ------------------------------------------------------------------ *

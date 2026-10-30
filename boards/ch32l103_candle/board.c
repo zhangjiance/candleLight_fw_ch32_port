@@ -14,33 +14,20 @@
 
 #include "ch32fun.h"
 
-/* HCLK cycles per millisecond, fixed by the (static) clock tree. */
-static uint32_t cycles_per_ms;
-
 /* the single periodic callback the application may install (may be NULL) */
 static board_tick_cb tick_cb;
 
-/*
- * SysTick is a free running 64bit up counter on the CH32L103 and is used as the
- * millisecond time base without an interrupt (the same scheme as the CH32V30x
- * board).  Only the low 32 bits are read: at 96 MHz that wraps every ~44 s,
- * which board_delay_ms()'s wrapping subtraction copes with, and it keeps the
- * divide out of libgcc (both operands stay 32 bit, so no __udivdi3).
- */
-static void board_init_systick(void)
-{
-    cycles_per_ms = (uint32_t)(FUNCONF_SYSTEM_CORE_CLOCK / 1000U);
+/* 1 ms monotonic counter, advanced by board_timer_create()'s tick ISR. */
+static volatile uint32_t s_time_ms;
 
-    SysTick->CTLR = 0;
-    SysTick->SR = 0;
-    SysTick->CNT = 0;
-    SysTick->CMP = 0xffffffffffffffffull;
-    SysTick->CTLR = 1 | (1 << 2);   /* STE | STCLK: count at HCLK */
+static void board_tick_1ms(void)
+{
+    s_time_ms++;
 }
 
 uint32_t board_time_ms(void)
 {
-    return (uint32_t)SysTick->CNT / cycles_per_ms;
+    return s_time_ms;
 }
 
 void board_delay_ms(uint32_t ms)
@@ -274,5 +261,9 @@ void board_init(void)
     board_init_boot_button();
 #endif
 
-    board_init_systick();
+    /* 1 ms time base for HAL_GetTick()/timer_get(), the status LED and the
+     * USB timestamps.  A full 32-bit millisecond counter is required: the old
+     * SysTick-derived value only spanned ~44 s, so deadlines near that limit
+     * could become unreachable. */
+    board_timer_create(1U, board_tick_1ms);
 }

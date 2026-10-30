@@ -495,10 +495,16 @@ void status_led_tick(void)
 #ifndef STATUS_LED_PULSE_MS
 #define STATUS_LED_PULSE_MS 30U
 #endif
+/* Minimum gap between two traffic pulses.  Without it, back-to-back frames
+ * keep extending the dark window and the LED never comes back on. */
+#ifndef STATUS_LED_REARM_MS
+#define STATUS_LED_REARM_MS 100U
+#endif
 
 static bool s_status_enabled;
 static bool s_status_error;
 static uint32_t s_status_pulse_until;
+static uint32_t s_status_rearm_at;
 
 /* Wrap-safe "has the deadline passed" (SEQ_ISPASSED lives in led.c). */
 static bool status_led_time_passed(uint32_t now, uint32_t target)
@@ -537,14 +543,15 @@ static void status_led_refresh(void)
         return;
     }
 
-    if (!status_led_time_passed(now, s_status_pulse_until)) {
-        status_led_apply(false);                /* inside the activity pulse */
+    /* Error (bus-off / error-passive) blinks at ~2 Hz.  It takes priority
+     * over traffic so a dead bus stays visible under heavy traffic. */
+    if (s_status_error) {
+        status_led_apply((now & 0x100U) != 0U);
         return;
     }
 
-    /* Error (bus-off / error-passive) blinks at ~2 Hz. */
-    if (s_status_error) {
-        status_led_apply((now & 0x100U) != 0U);
+    if (!status_led_time_passed(now, s_status_pulse_until)) {
+        status_led_apply(false);                /* inside the activity pulse */
         return;
     }
 
@@ -560,6 +567,7 @@ void status_led_init(void)
     s_status_enabled = false;
     s_status_error = false;
     s_status_pulse_until = 0U;
+    s_status_rearm_at = 0U;
     status_led_apply(false);
 }
 
@@ -576,6 +584,7 @@ void status_led_channel(uint8_t channel, bool enabled)
     s_status_enabled = enabled;
     if (!enabled) {
         s_status_pulse_until = 0U;
+        s_status_rearm_at = 0U;
         s_status_error = false;
         s_status_identify = false;
     }
@@ -590,7 +599,17 @@ void status_led_activity(uint8_t channel, bool rx)
         return;
     }
 
-    s_status_pulse_until = HAL_GetTick() + STATUS_LED_PULSE_MS;
+    const uint32_t now = HAL_GetTick();
+
+    /* Re-arm at a fixed maximum rate: one short dark pulse per window, not
+     * one per frame.  Continuous traffic then reads as flicker instead of a
+     * permanently dark LED. */
+    if ((int32_t)(now - s_status_rearm_at) < 0) {
+        return;
+    }
+
+    s_status_pulse_until = now + STATUS_LED_PULSE_MS;
+    s_status_rearm_at = now + STATUS_LED_REARM_MS;
     status_led_refresh();
 }
 

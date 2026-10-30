@@ -28,9 +28,9 @@ extern "C" {
 /* System clock / time base / LED / BOOT pin bring-up. */
 void board_init(void);
 
-/* Free running millisecond time base, derived from SysTick.  The board owns
- * SysTick, so ch32fun's Delay_Ms()/Delay_Us() (which drive it too) must not be
- * used: call board_delay_ms() instead. */
+/* Monotonic millisecond time base, advanced by the board's 1 ms tick ISR.
+ * It is a full 32-bit counter (wraps after ~49 days); callers should use
+ * wrapping subtraction for deadlines. */
 uint32_t board_time_ms(void);
 void board_delay_ms(uint32_t ms);
 
