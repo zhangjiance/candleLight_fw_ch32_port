@@ -31,11 +31,48 @@ static void bt_from_gs(const struct gs_device_bittiming *bt, can_ch32_timing_t *
     out->bitrate      = (uint32_t)(CAN_CLOCK_SPEED / (brp * tq));
     out->sample_point = (uint16_t)(((1U + bt->prop_seg + bt->phase_seg1) * 1000U) / tq);
     out->sjw          = (uint16_t)(bt->sjw == 0U ? 1U : bt->sjw);
+
+    /* The segments the host computed, handed to the driver unchanged. */
+    out->brp          = (uint16_t)brp;
+    out->ts1          = (uint16_t)(bt->prop_seg + bt->phase_seg1);
+    out->ts2          = (uint16_t)bt->phase_seg2;
+}
+
+/*
+ * If the driver had to adjust the request (hardware range), report what is
+ * really programmed, so GET_BITTIMING never disagrees with the cell.  When
+ * the host's combination was used verbatim this does nothing.
+ */
+static void bt_store(const can_ch32_timing_t *resolved,
+                     struct gs_device_bittiming *bt)
+{
+    if ((bt->brp == resolved->brp) &&
+        ((bt->prop_seg + bt->phase_seg1) == resolved->ts1) &&
+        (bt->phase_seg2 == resolved->ts2) &&
+        (bt->sjw == resolved->sjw)) {
+        return;
+    }
+
+    bt->brp        = resolved->brp;
+    bt->prop_seg   = 1U;
+    bt->phase_seg1 = (resolved->ts1 > 1U) ? (uint32_t)(resolved->ts1 - 1U) : 0U;
+    bt->phase_seg2 = resolved->ts2;
+    bt->sjw        = resolved->sjw;
 }
 
 /* -------------------------------------------------------------------------- */
 /* can.h                                                                      */
 /* -------------------------------------------------------------------------- */
+
+/*
+ * True only once can_ch32_init() has actually succeeded.  can_drv_enable()
+ * runs in the USB interrupt and merely queues the start, so between
+ * MODE_START and the next can_drv_poll() the controller is not running yet:
+ * without this flag can_send() would push a classic frame into a stopped
+ * cell and return true, and the host would get an echo for a frame that the
+ * following initialisation throws away.
+ */
+static volatile bool s_controller_ready;
 
 void can_init(can_data_t *channel, const struct board_channel_config *config)
 {
@@ -132,6 +169,10 @@ bool can_send(can_data_t *channel, struct gs_host_frame *frame)
 {
     can_ch32_frame_t f;
 
+    if (!s_controller_ready) {
+        return false;              /* frame stays queued, retried next loop */
+    }
+
     memset(&f, 0, sizeof(f));
     f.extended = (frame->can_id & 0x80000000U) != 0U;
     f.rtr      = (frame->can_id & 0x40000000U) != 0U;
@@ -185,6 +226,10 @@ void can_drv_poll(can_data_t *channel)
     const bool listen_only = (channel->feature & GS_CAN_FEATURE_LISTEN_ONLY) != 0U;
     const bool loopback    = (channel->feature & GS_CAN_FEATURE_LOOP_BACK) != 0U;
 
+    /* TDC parameters configured by the host (SET_TDC); otherwise the driver
+     * picks the defaults (offset = data-phase SEG1). */
+    const bool tdc_set = (channel->flags & CAN_CHANNEL_FLAG_TDC_SET) != 0U;
+
     bt_from_gs(&channel->bittiming, &nom);
 #if defined(CONFIG_CANFD)
     bt_from_gs(&channel->data_bittiming, &dat);
@@ -192,11 +237,22 @@ void can_drv_poll(can_data_t *channel)
     dat = nom;
 #endif
 
-    if (!can_ch32_init(CAN_CLOCK_SPEED, &nom, &dat, true, listen_only, loopback)) {
+    if (!can_ch32_init(CAN_CLOCK_SPEED, &nom, &dat, true, listen_only, loopback,
+                        tdc_set, (uint8_t)channel->tdc.tdco, (uint8_t)channel->tdc.tdcf)) {
+        s_controller_ready = false;
         channel->state = GS_CAN_STATE_ERROR_PASSIVE;
         return;
     }
 
+    /* nom/dat now hold what the cell really uses (see bt_store()). */
+    bt_store(&nom, &channel->bittiming);
+#if defined(CONFIG_CANFD)
+    if (channel->feature & GS_CAN_FEATURE_FD) {
+        bt_store(&dat, &channel->data_bittiming);
+    }
+#endif
+
+    s_controller_ready = true;
     channel->state = GS_CAN_STATE_ERROR_ACTIVE;
     led_set_mode(&channel->leds, LED_MODE_NORMAL);
     status_led_channel(can_channel_get_nr(channel), true);
@@ -205,6 +261,7 @@ void can_drv_poll(can_data_t *channel)
 void can_drv_disable(can_data_t *channel)
 {
     s_start_pending = false;
+    s_controller_ready = false;
     g_rx_next_valid = false;
 
     can_ch32_stop();
@@ -222,21 +279,49 @@ void can_drv_read_reg_status(can_data_t *channel)
     channel->reg_status.esr = (st.tx_error_count << 16) | (st.rx_error_count << 24) |
                               (st.warning ? 1U : 0U) | (st.error_passive ? 2U : 0U) |
                               (st.bus_off ? 4U : 0U);
+
+    /* CAN_HandleError() calls this every loop iteration, so the status LED
+     * can show a dead bus: bus-off / error-passive blink at ~2 Hz instead of
+     * the steady-on of a healthy idle channel. */
+    status_led_error(can_channel_get_nr(channel), st.bus_off || st.error_passive);
 }
 
 bool can_drv_bus_error_pending(const can_data_t *channel)
 {
     (void)channel;
 
-    return false;           /* no error frame reporting yet */
+    /* A latched bus error, or frames lost to a receive FIFO overrun. */
+    return can_ch32_error_pending() || can_ch32_rx_overrun_pending();
 }
 
 bool can_drv_handle_bus_error(const can_data_t *channel, struct gs_host_frame *frame)
 {
-    (void)channel;
-    (void)frame;
+    bool handled = false;
+    can_ch32_error_t err;
 
-    return false;
+    (void)channel;
+
+    if (can_ch32_take_error(&err)) {
+        /* data[6]/data[7] carry the error counters, data[2..3] the protocol
+         * location - the layout candleLight's error frames use (see
+         * can_lec_error_to_frame()). */
+        frame->classic_can->data[6] = err.tec;
+        frame->classic_can->data[7] = err.rec;
+
+        frame->can_id |= CAN_ERR_PROT | CAN_ERR_BUSERROR | CAN_ERR_CNT;
+        can_lec_error_to_frame(frame, err.lec);
+
+        handled = true;
+    }
+
+    if (can_ch32_take_rx_overrun()) {
+        frame->can_id |= CAN_ERR_CRTL;
+        frame->classic_can->data[1] |= CAN_ERR_CRTL_RX_OVERFLOW;
+
+        handled = true;
+    }
+
+    return handled;
 }
 
 enum gs_can_state can_drv_get_state(const can_data_t *channel)
@@ -274,8 +359,23 @@ void can_drv_get_device_state(const can_data_t *channel, struct gs_device_state 
 
 void can_drv_handle_state_change(const can_data_t *channel, struct gs_host_frame *frame)
 {
+    can_ch32_state_t st;
+
     (void)channel;
-    (void)frame;
+
+    /* A state change is reported as CAN_ERR_CRTL with the TX/RX error state
+     * in data[1] (same encoding as the other candleLight ports). */
+    can_ch32_get_state(&st);
+
+    const enum gs_can_state tx_state = can_err_to_state(st.tx_error_count);
+    const enum gs_can_state rx_state = can_err_to_state(st.rx_error_count);
+
+    if (tx_state >= rx_state) {
+        frame->classic_can->data[1] |= gs_can_tx_state_to_frame(tx_state);
+    }
+    if (tx_state <= rx_state) {
+        frame->classic_can->data[1] |= gs_can_rx_state_to_frame(rx_state);
+    }
 }
 
 void can_drv_handle_bus_off_recovery(can_data_t *channel)
@@ -305,8 +405,10 @@ void can_drv_get_device_tdc(const can_data_t *channel, struct gs_device_tdc *tdc
 {
     (void)channel;
 
-    tdc->tdco = 0U;
-    tdc->tdcf = 0U;
+    /* can_get_device_tdc() already copied what the host configured; this adds
+     * the delay the cell actually measured (CANFD_PSR.TDCV minus the
+     * programmed offset) so the host can see the real compensation. */
+    tdc->tdcv = can_ch32_tdcv();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -317,6 +419,8 @@ void can_drv_get_device_tdc(const can_data_t *channel, struct gs_device_tdc *tdc
                      GS_CAN_FEATURE_HW_TIMESTAMP |\
                      GS_CAN_FEATURE_IDENTIFY |    \
                      GS_CAN_FEATURE_FD |          \
+                     GS_CAN_FEATURE_TDC |         \
+                     GS_CAN_FEATURE_BERR_REPORTING | \
                      GS_CAN_FEATURE_BT_CONST_EXT |\
                      GS_CAN_FEATURE_TERMINATION | \
                      GS_CAN_FEATURE_GET_STATE)
@@ -350,6 +454,8 @@ const struct gs_device_bt_const_extended CAN_btconst_ext = {
 };
 
 const struct gs_device_tdc_const CAN_tdc_const = {
+    .tdcv_min = 0,                 /* CANFD_PSR.TDCV is 8 bit */
+    .tdcv_max = 255,
     .tdco_min = 0,
     .tdco_max = 63,
     .tdcf_min = 0,

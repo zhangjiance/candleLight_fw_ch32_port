@@ -47,6 +47,16 @@ typedef struct {
     uint32_t bitrate;       /* bit/s */
     uint16_t sample_point;  /* per mille, e.g. 875 = 87.5% */
     uint16_t sjw;           /* in time quanta */
+
+    /* The host (Linux gs_usb, cangaroo, ...) computes the segments itself
+     * from the bittiming constants this port advertises, so its numbers are
+     * authoritative: can_ch32_init() programs them verbatim when they are
+     * within hardware range, and only solves them itself otherwise (0 =
+     * not provided).  After a successful init the fields hold what was
+     * really programmed. */
+    uint16_t brp;           /* prescaler, 1..1024 (data phase 1..32) */
+    uint16_t ts1;           /* prop_seg + phase_seg1, 1..16 */
+    uint16_t ts2;           /* phase_seg2, 1..8 */
 } can_ch32_timing_t;
 
 /* Bring the controller up.  pclk1 is the APB1 clock the CAN cell runs from.
@@ -57,11 +67,14 @@ typedef struct {
  *               so a node without a transceiver (bench board) can still transmit
  *               and see the frames come back on the RX path. */
 bool can_ch32_init(uint32_t pclk1,
-                   const can_ch32_timing_t *nominal,
-                   const can_ch32_timing_t *data,
+                   can_ch32_timing_t *nominal,
+                   can_ch32_timing_t *data,
                    bool fd,
                    bool listen_only,
-                   bool loopback);
+                   bool loopback,
+                   bool tdc_set,
+                   uint8_t tdco,
+                   uint8_t tdcf);
 
 /* True once can_ch32_init() ran with fd == true and succeeded.  The bench
  * transmitter uses it to fall back to a classic frame if the FD
@@ -77,6 +90,37 @@ bool can_ch32_send(const can_ch32_frame_t *f);
 /* Pull one received frame out of the FIFOs.  Returns false when both are
  * empty. */
 bool can_ch32_receive(can_ch32_frame_t *f);
+
+/* Frames dropped by a receive FIFO overrun since the last start. */
+uint32_t can_ch32_rx_overruns(void);
+
+/* Measured transmitter delay (CANFD_PSR.TDCV) minus the programmed
+ * offset, i.e. the pure loop delay the hardware measured; 0 until an
+ * FD frame with BRS has been sent. */
+uint32_t can_ch32_tdcv(void);
+
+/* One bus error as reported by the cell (CAN_ERRSR), plus the error counters
+ * at the time it happened. */
+typedef struct {
+    uint8_t lec;            /* last error code, 1..6 */
+    uint8_t tec;            /* transmit error counter */
+    uint8_t rec;            /* receive error counter */
+    bool    warning;
+    bool    error_passive;
+    bool    bus_off;
+} can_ch32_error_t;
+
+/* Non-destructive: is a bus error latched in CAN_ERRSR.LEC? */
+bool can_ch32_error_pending(void);
+
+/* Reads and re-arms the LEC latch (LEC = 7, "set by software"). */
+bool can_ch32_take_error(can_ch32_error_t *e);
+
+/* Receive FIFO overrun: pending check is non-destructive, take() marks it
+ * reported so every lost frame is announced exactly once. */
+bool can_ch32_rx_overrun_pending(void);
+bool can_ch32_take_rx_overrun(void);
+
 
 /* Bus state for gs_usb's GET_STATE / error counters. */
 typedef struct {
